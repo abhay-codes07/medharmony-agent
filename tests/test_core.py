@@ -1,5 +1,9 @@
 """Tests for MedHarmony Agent."""
 
+import os
+import types as pytypes
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from src.models.medication import (
     Medication,
@@ -142,7 +146,8 @@ class TestAgentCard:
 # =============================================================================
 
 class TestDemoPatient:
-    def test_demo_patient_has_dangerous_combos(self):
+    @patch("src.core.reconciliation.LLMClient")
+    def test_demo_patient_has_dangerous_combos(self, _mock_llm):
         """The demo patient should have intentionally dangerous medication combos
         that MedHarmony should catch."""
         from src.core.reconciliation import ReconciliationEngine
@@ -177,7 +182,8 @@ class TestDemoPatient:
         assert potassium is not None
         assert potassium.value > 5.0
 
-    def test_demo_has_reconciliation_discrepancies(self):
+    @patch("src.core.reconciliation.LLMClient")
+    def test_demo_has_reconciliation_discrepancies(self, _mock_llm):
         """Demo patient should have differences between admission and discharge lists."""
         from src.core.reconciliation import ReconciliationEngine
         engine = ReconciliationEngine()
@@ -197,3 +203,180 @@ class TestDemoPatient:
         only_discharge = discharge_meds - admission_meds
         assert len(only_admission) > 0, "Should have meds dropped at discharge"
         assert len(only_discharge) > 0, "Should have new meds at discharge"
+
+
+# =============================================================================
+# MCP Tool Bridge Tests
+# =============================================================================
+
+@pytest.mark.skipif(
+    not os.getenv("GEMINI_API_KEY"),
+    reason="Requires GEMINI_API_KEY to indicate live integration environment",
+)
+@pytest.mark.asyncio
+class TestMCPToolBridgeListsTools:
+    """Integration test: MCPToolBridge connects to MCP servers and discovers tools."""
+
+    async def test_mcp_tool_bridge_lists_tools(self):
+        from src.core.mcp_tool_bridge import MCPToolBridge
+
+        async with MCPToolBridge() as bridge:
+            tools_by_server = bridge.list_all_tools()
+
+            # All three servers should be connected
+            assert "fhir" in tools_by_server, "FHIR server should be connected"
+            assert "drug_interactions" in tools_by_server, "Drug server should be connected"
+            assert "clinical_guidelines" in tools_by_server, "Guidelines server should be connected"
+
+            # Each server should expose at least one tool
+            assert len(tools_by_server["fhir"]) >= 1
+            assert len(tools_by_server["drug_interactions"]) >= 1
+            assert len(tools_by_server["clinical_guidelines"]) >= 1
+
+            # FHIR server should have get_patient_summary
+            fhir_names = {t.name for t in tools_by_server["fhir"]}
+            assert "get_patient_summary" in fhir_names
+
+            # Drug server should have check_drug_interactions
+            drug_names = {t.name for t in tools_by_server["drug_interactions"]}
+            assert "check_drug_interactions" in drug_names
+
+            # Guidelines server should have search_deprescribing_guidelines
+            guide_names = {t.name for t in tools_by_server["clinical_guidelines"]}
+            assert "search_deprescribing_guidelines" in guide_names
+
+
+# =============================================================================
+# Gemini Tool Format Conversion Tests
+# =============================================================================
+
+@pytest.mark.skipif(
+    not os.getenv("GEMINI_API_KEY"),
+    reason="Requires GEMINI_API_KEY to indicate live integration environment",
+)
+class TestGeminiToolFormatConversion:
+    """Tests that MCP tool definitions are correctly converted to Gemini format."""
+
+    def _make_mock_tool(self, name: str, description: str, schema: dict):
+        """Create a minimal mock MCP Tool object."""
+        tool = MagicMock()
+        tool.name = name
+        tool.description = description
+        tool.inputSchema = schema
+        return tool
+
+    def test_schema_string_type(self):
+        from src.core.mcp_tool_bridge import MCPToolBridge
+        from google.genai import types
+
+        bridge = MCPToolBridge()
+        schema = bridge._schema_to_gemini({"type": "string", "description": "A drug name"})
+        assert schema is not None
+        assert schema.type == types.Type.STRING
+        assert schema.description == "A drug name"
+
+    def test_schema_object_with_properties(self):
+        from src.core.mcp_tool_bridge import MCPToolBridge
+        from google.genai import types
+
+        bridge = MCPToolBridge()
+        schema = bridge._schema_to_gemini({
+            "type": "object",
+            "properties": {
+                "patient_id": {"type": "string", "description": "Patient ID"},
+                "age": {"type": "integer", "description": "Age in years"},
+            },
+            "required": ["patient_id"],
+        })
+        assert schema is not None
+        assert schema.type == types.Type.OBJECT
+        assert "patient_id" in schema.properties
+        assert "age" in schema.properties
+        assert schema.properties["patient_id"].type == types.Type.STRING
+        assert schema.properties["age"].type == types.Type.INTEGER
+        assert schema.required == ["patient_id"]
+
+    def test_schema_array_with_items(self):
+        from src.core.mcp_tool_bridge import MCPToolBridge
+        from google.genai import types
+
+        bridge = MCPToolBridge()
+        schema = bridge._schema_to_gemini({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of drug names",
+        })
+        assert schema is not None
+        assert schema.type == types.Type.ARRAY
+        assert schema.items is not None
+        assert schema.items.type == types.Type.STRING
+
+    def test_gemini_tool_format_conversion(self):
+        """Full conversion: mock MCP tools → Gemini Tool object."""
+        from src.core.mcp_tool_bridge import MCPToolBridge
+        from google.genai import types
+
+        bridge = MCPToolBridge()
+
+        # Inject mock tools directly (bypasses live server connection)
+        bridge._mcp_tools = {
+            "drug_interactions": [
+                self._make_mock_tool(
+                    "check_drug_interactions",
+                    "Check drug-drug interactions",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "drug_list": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of drug names",
+                            }
+                        },
+                        "required": ["drug_list"],
+                    },
+                )
+            ],
+            "clinical_guidelines": [
+                self._make_mock_tool(
+                    "search_deprescribing_guidelines",
+                    "Search Beers Criteria and STOPP/START",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "medications": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "age": {"type": "integer"},
+                            "egfr": {"type": "number"},
+                        },
+                        "required": ["medications"],
+                    },
+                )
+            ],
+        }
+        bridge._tool_to_server = {
+            "check_drug_interactions": "drug_interactions",
+            "search_deprescribing_guidelines": "clinical_guidelines",
+        }
+
+        gemini_tools = bridge.convert_mcp_tools_to_gemini_format()
+
+        assert len(gemini_tools) == 1, "Should return a single Tool object"
+        tool_obj = gemini_tools[0]
+        assert isinstance(tool_obj, types.Tool)
+
+        decl_names = {d.name for d in tool_obj.function_declarations}
+        assert "check_drug_interactions" in decl_names
+        assert "search_deprescribing_guidelines" in decl_names
+
+        # Verify parameter schema is correct
+        check_decl = next(
+            d for d in tool_obj.function_declarations
+            if d.name == "check_drug_interactions"
+        )
+        assert check_decl.parameters is not None
+        assert check_decl.parameters.type == types.Type.OBJECT
+        assert "drug_list" in check_decl.parameters.properties
+        assert check_decl.parameters.properties["drug_list"].type == types.Type.ARRAY

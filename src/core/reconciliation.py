@@ -15,7 +15,9 @@ from typing import Optional
 
 from loguru import logger
 
+from src.core.agent_loop import AgentLoop
 from src.core.llm_client import LLMClient
+from src.core.mcp_tool_bridge import MCPToolBridge
 from src.models.medication import (
     DeprescribingRecommendation,
     DrugInteraction,
@@ -60,30 +62,49 @@ class ReconciliationEngine:
             patient_ctx = self._get_demo_patient_context(sharp_context.patient_id)
 
         # =====================================================================
-        # Step 2: Reconcile medication lists
+        # Initialize MCP Tool Bridge for agentic tool use
         # =====================================================================
-        logger.info("Step 2: Reconciling medication lists...")
-        reconciliation = await self._reconcile(patient_ctx)
+        bridge: Optional[MCPToolBridge] = None
+        try:
+            bridge = MCPToolBridge()
+            await bridge.initialize()
+            tool_count = sum(len(v) for v in bridge.list_all_tools().values())
+            logger.info(f"MCPToolBridge ready: {tool_count} tools across 3 servers")
+        except Exception as e:
+            logger.warning(
+                f"MCPToolBridge unavailable — running without MCP tools: {e}"
+            )
 
-        # =====================================================================
-        # Step 3: Analyze drug interactions
-        # =====================================================================
-        logger.info("Step 3: Analyzing drug interactions...")
-        interactions = await self._analyze_interactions(patient_ctx)
+        try:
+            # =====================================================================
+            # Step 2: Reconcile medication lists
+            # =====================================================================
+            logger.info("Step 2: Reconciling medication lists...")
+            reconciliation = await self._reconcile(patient_ctx)
 
-        # =====================================================================
-        # Step 4: Apply deprescribing guidelines
-        # =====================================================================
-        logger.info("Step 4: Checking deprescribing opportunities...")
-        deprescribing = await self._check_deprescribing(patient_ctx)
+            # =====================================================================
+            # Step 3: Analyze drug interactions (with MCP drug interaction tools)
+            # =====================================================================
+            logger.info("Step 3: Analyzing drug interactions...")
+            interactions = await self._analyze_interactions(patient_ctx, bridge)
 
-        # =====================================================================
-        # Step 5: Generate clinician brief
-        # =====================================================================
-        logger.info("Step 5: Generating clinician brief...")
-        brief = await self._generate_brief(
-            patient_ctx, reconciliation, interactions, deprescribing
-        )
+            # =====================================================================
+            # Step 4: Apply deprescribing guidelines (with MCP guideline tools)
+            # =====================================================================
+            logger.info("Step 4: Checking deprescribing opportunities...")
+            deprescribing = await self._check_deprescribing(patient_ctx, bridge)
+
+            # =====================================================================
+            # Step 5: Generate clinician brief
+            # =====================================================================
+            logger.info("Step 5: Generating clinician brief...")
+            brief = await self._generate_brief(
+                patient_ctx, reconciliation, interactions, deprescribing
+            )
+
+        finally:
+            if bridge:
+                await bridge.cleanup()
 
         # =====================================================================
         # Compile final result
@@ -157,9 +178,19 @@ class ReconciliationEngine:
         return self._parse_reconciliation(raw)
 
     async def _analyze_interactions(
-        self, patient_ctx: PatientContext
+        self,
+        patient_ctx: PatientContext,
+        bridge: Optional[MCPToolBridge] = None,
     ) -> list[DrugInteraction]:
-        """Analyze drug interactions."""
+        """Analyze drug interactions, using MCP drug interaction tools when available."""
+        all_meds = [
+            med.model_dump()
+            for ml in patient_ctx.medication_lists
+            for med in ml.medications
+        ]
+        if not all_meds:
+            return []
+
         patient_dict = {
             "patient_id": patient_ctx.patient_id,
             "age": patient_ctx.age,
@@ -170,29 +201,52 @@ class ReconciliationEngine:
             "lab_results": [l.model_dump() for l in patient_ctx.lab_results],
         }
 
-        # Flatten all medications
-        all_meds = []
-        for ml in patient_ctx.medication_lists:
-            for med in ml.medications:
-                all_meds.append(med.model_dump())
+        if bridge:
+            context = (
+                f"PATIENT CONTEXT:\n{json.dumps(patient_dict, indent=2)}\n\n"
+                f"MEDICATIONS:\n{json.dumps(all_meds, indent=2)}"
+            )
+            prompt = """Use the available drug interaction tools to look up known
+interactions between this patient's medications, then perform a comprehensive
+clinical analysis considering their specific context (age, renal function,
+allergies, conditions, lab values).
 
-        if not all_meds:
-            return []
+Identify all of:
+1. Drug-drug interactions (pharmacokinetic and pharmacodynamic)
+2. Drug-condition contraindications
+3. Drug-allergy cross-reactivity
+4. Drug-lab interactions
+5. Duplicate therapy / therapeutic overlap
 
-        # TODO: In production, query RxNorm/OpenFDA MCP server for known interactions
-        known_interactions: list[dict] = []
+Respond with a JSON array only (no markdown fences):
+[{"type":"drug-drug|drug-condition|drug-allergy|drug-lab|duplicate-therapy","severity":"critical|high|moderate|low","drug_a":"...","drug_b":"...","condition":"...","allergy":"...","lab":"...","description":"...","clinical_significance":"...","recommendation":"...","evidence_source":"..."}]"""
+            loop = AgentLoop(self.llm, bridge)
+            raw = await loop.run(
+                prompt,
+                context=context,
+                tool_filter=["check_drug_interactions", "get_drug_info", "lookup_rxnorm"],
+            )
+        else:
+            raw = await self.llm.analyze_interactions(patient_dict, all_meds, [])
 
-        raw = await self.llm.analyze_interactions(
-            patient_dict, all_meds, known_interactions
-        )
         return self._parse_interactions(raw)
 
     async def _check_deprescribing(
-        self, patient_ctx: PatientContext
+        self,
+        patient_ctx: PatientContext,
+        bridge: Optional[MCPToolBridge] = None,
     ) -> list[DeprescribingRecommendation]:
-        """Check for deprescribing opportunities."""
+        """Check for deprescribing opportunities using guideline MCP tools when available."""
         if patient_ctx.age and patient_ctx.age < 65:
             logger.info("Patient < 65, limited Beers Criteria applicability")
+
+        all_meds = [
+            med.model_dump()
+            for ml in patient_ctx.medication_lists
+            for med in ml.medications
+        ]
+        if not all_meds:
+            return []
 
         patient_dict = {
             "patient_id": patient_ctx.patient_id,
@@ -203,20 +257,31 @@ class ReconciliationEngine:
             "lab_results": [l.model_dump() for l in patient_ctx.lab_results],
         }
 
-        all_meds = []
-        for ml in patient_ctx.medication_lists:
-            for med in ml.medications:
-                all_meds.append(med.model_dump())
+        if bridge:
+            context = (
+                f"PATIENT CONTEXT:\n{json.dumps(patient_dict, indent=2)}\n\n"
+                f"MEDICATIONS:\n{json.dumps(all_meds, indent=2)}"
+            )
+            prompt = """Use the available clinical guideline tools to retrieve Beers
+Criteria 2023 and STOPP/START v3 recommendations relevant to this patient's
+medications, age, and renal function (eGFR). Then provide evidence-based
+deprescribing recommendations for each applicable medication.
 
-        if not all_meds:
-            return []
+Respond with a JSON array only (no markdown fences):
+[{"medication":"...","criteria":"...","reason":"...","recommendation":"...","severity":"critical|high|moderate|low","tapering_plan":"...","alternatives":["..."]}]"""
+            loop = AgentLoop(self.llm, bridge)
+            raw = await loop.run(
+                prompt,
+                context=context,
+                tool_filter=[
+                    "search_deprescribing_guidelines",
+                    "get_beers_criteria",
+                    "get_tapering_protocol",
+                ],
+            )
+        else:
+            raw = await self.llm.suggest_deprescribing(patient_dict, all_meds, [])
 
-        # TODO: In production, query Clinical Guidelines MCP server for RAG excerpts
-        guideline_excerpts: list[dict] = []
-
-        raw = await self.llm.suggest_deprescribing(
-            patient_dict, all_meds, guideline_excerpts
-        )
         return self._parse_deprescribing(raw)
 
     async def _generate_brief(
@@ -371,7 +436,7 @@ class ReconciliationEngine:
     # =========================================================================
 
     def _get_demo_patient_context(self, patient_id: str) -> PatientContext:
-        """Return a synthetic complex patient for demo purposes."""
+        """Return a synthetic complex patient for offline demo and testing."""
         from src.models.medication import (
             Allergy, Condition, LabResult, Medication, MedicationList,
         )

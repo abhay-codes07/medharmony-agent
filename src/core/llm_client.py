@@ -1,23 +1,34 @@
-"""Claude LLM client for MedHarmony clinical reasoning."""
+"""Gemini LLM client for MedHarmony clinical reasoning."""
 
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Callable, Coroutine, Optional
 
-import anthropic
+from google import genai
+from google.genai import types
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.agent.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from src.agent.config import GEMINI_API_KEY, GEMINI_MODEL
+
+# Max iterations for the agentic tool-use loop before returning whatever we have
+_MAX_TOOL_ITERATIONS = 10
 
 
 class LLMClient:
-    """Wrapper around the Anthropic Claude API for clinical reasoning."""
+    """Wrapper around the Google Gemini API for clinical reasoning.
+
+    Provides both plain text completion (analyze) and an agentic tool-use loop
+    (analyze_with_tools) where Gemini autonomously decides which MCP tools to
+    call, in what order, until it produces a final text response.
+    """
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        self.model = CLAUDE_MODEL
+        # NOTE: GEMINI_API_KEY must be set in .env.  If empty the client will
+        # still construct but every call will raise an authentication error.
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.model = GEMINI_MODEL
         self.system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self) -> str:
@@ -40,6 +51,10 @@ CRITICAL RULES:
 
 OUTPUT FORMAT: Always respond with structured JSON when asked for analysis results."""
 
+    # -------------------------------------------------------------------------
+    # Core completion method (plain text, no tools)
+    # -------------------------------------------------------------------------
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -50,40 +65,204 @@ OUTPUT FORMAT: Always respond with structured JSON when asked for analysis resul
         context: Optional[str] = None,
         response_format: str = "json",
     ) -> str:
-        """Send a clinical analysis prompt to Claude."""
-        messages = []
+        """Send a clinical analysis prompt to Gemini.
+
+        Args:
+            prompt: The clinical reasoning prompt.
+            context: Optional patient context to prepend as prior conversation turns.
+            response_format: "json" or "markdown" — used only to set expectations
+                in the prompt (Gemini does not have a native JSON mode flag in this SDK).
+
+        Returns:
+            The model's text response.
+        """
+        contents: list[types.Content] = []
 
         if context:
-            messages.append({"role": "user", "content": context})
-            messages.append({
-                "role": "assistant",
-                "content": "I have received the patient context. Ready for analysis."
-            })
-
-        messages.append({"role": "user", "content": prompt})
-
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=self.system_prompt,
-                messages=messages,
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(context)],
+                )
+            )
+            contents.append(
+                types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        "I have received the patient context. Ready for analysis."
+                    )],
+                )
             )
 
-            result = response.content[0].text
-            logger.debug(f"LLM response length: {len(result)} chars")
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(prompt)],
+            )
+        )
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=self.system_prompt,
+                    temperature=0.2,
+                    max_output_tokens=4096,
+                ),
+            )
+
+            result = response.text
+            logger.debug(f"Gemini response length: {len(result)} chars")
             return result
 
-        except anthropic.APIError as e:
-            logger.error(f"Claude API error: {e}")
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
             raise
+
+    # -------------------------------------------------------------------------
+    # Agentic tool-use loop
+    # -------------------------------------------------------------------------
+
+    async def analyze_with_tools(
+        self,
+        prompt: str,
+        tools: list[types.Tool],
+        tool_executor: Callable[[str, dict], Coroutine[Any, Any, str]],
+        context: Optional[str] = None,
+    ) -> str:
+        """Run an agentic reasoning loop: Gemini decides which tools to call.
+
+        Sends the prompt + available tools to Gemini.  If Gemini responds with
+        function calls, executes them via ``tool_executor``, appends the results,
+        and calls Gemini again.  Loops until Gemini returns a pure text response
+        or ``_MAX_TOOL_ITERATIONS`` is reached.
+
+        Args:
+            prompt: The clinical reasoning prompt.
+            tools: List of ``types.Tool`` objects (Gemini function declarations).
+            tool_executor: Async callable ``(tool_name, arguments) -> str``
+                that routes the call to the correct MCP server.
+            context: Optional prior context string (prepended as user/model turns).
+
+        Returns:
+            The model's final text response.
+        """
+        contents: list[types.Content] = []
+
+        if context:
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(context)])
+            )
+            contents.append(
+                types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        "I have received the patient context. Ready for analysis."
+                    )],
+                )
+            )
+
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(prompt)])
+        )
+
+        for iteration in range(_MAX_TOOL_ITERATIONS):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.system_prompt,
+                        tools=tools,
+                        temperature=0.2,
+                        max_output_tokens=4096,
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Gemini API error (iteration {iteration}): {e}")
+                raise
+
+            candidate = response.candidates[0]
+
+            # Collect function calls from this response turn
+            function_calls = [
+                part.function_call
+                for part in candidate.content.parts
+                if part.function_call
+            ]
+
+            if not function_calls:
+                # No more tool calls — return the final text
+                logger.debug(
+                    f"Gemini finished after {iteration} tool iterations; "
+                    f"response length: {len(response.text)} chars"
+                )
+                return response.text
+
+            logger.info(
+                f"[tool-loop] iteration={iteration}, "
+                f"tool_calls={[fc.name for fc in function_calls]}"
+            )
+
+            # Append the model's function-call turn to the conversation
+            contents.append(candidate.content)
+
+            # Execute each function call and collect responses
+            tool_response_parts: list[types.Part] = []
+            for fc in function_calls:
+                tool_name = fc.name
+                tool_args = dict(fc.args)
+
+                logger.info(f"  → calling tool: {tool_name}({tool_args})")
+                try:
+                    result_text = await tool_executor(tool_name, tool_args)
+                except Exception as exc:
+                    result_text = json.dumps({"error": str(exc), "tool": tool_name})
+                    logger.warning(f"  ✗ {tool_name} failed: {exc}")
+                else:
+                    logger.info(f"  ✓ {tool_name} returned {len(result_text)} chars")
+
+                tool_response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=tool_name,
+                            response={"result": result_text},
+                        )
+                    )
+                )
+
+            # Append tool responses as a user turn (Gemini convention)
+            contents.append(
+                types.Content(role="user", parts=tool_response_parts)
+            )
+
+        # Exhausted max iterations — do a final call without tools
+        logger.warning(
+            f"Reached max tool iterations ({_MAX_TOOL_ITERATIONS}); "
+            "calling Gemini without tools to force a text response."
+        )
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                temperature=0.2,
+                max_output_tokens=4096,
+            ),
+        )
+        return response.text
+
+    # -------------------------------------------------------------------------
+    # Convenience wrappers (unchanged public interface)
+    # -------------------------------------------------------------------------
 
     async def reconcile_medications(
         self,
         patient_context: dict,
         medication_lists: list[dict],
     ) -> str:
-        """Ask Claude to reconcile medication lists."""
+        """Ask Gemini to reconcile medication lists."""
         context = f"""PATIENT CONTEXT:
 {json.dumps(patient_context, indent=2)}
 
@@ -119,7 +298,7 @@ Respond with a JSON array of reconciliation entries:
         medications: list[dict],
         known_interactions: list[dict],
     ) -> str:
-        """Ask Claude to analyze drug interactions in patient context."""
+        """Ask Gemini to analyze drug interactions in patient context."""
         context = f"""PATIENT CONTEXT:
 {json.dumps(patient_context, indent=2)}
 
@@ -164,7 +343,7 @@ For each interaction found, respond with JSON:
         medications: list[dict],
         guideline_excerpts: list[dict],
     ) -> str:
-        """Ask Claude for deprescribing recommendations."""
+        """Ask Gemini for deprescribing recommendations."""
         context = f"""PATIENT CONTEXT:
 {json.dumps(patient_context, indent=2)}
 

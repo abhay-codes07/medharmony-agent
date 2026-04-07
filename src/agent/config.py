@@ -12,9 +12,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 GUIDELINES_DIR = DATA_DIR / "guidelines"
 SYNTHETIC_PATIENTS_DIR = DATA_DIR / "synthetic_patients"
 
-# Anthropic
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+# Google Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.0-flash")
 
 # A2A Agent
 A2A_HOST = os.getenv("A2A_HOST", "0.0.0.0")

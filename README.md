@@ -2,7 +2,7 @@
 
 ### Intelligent Medication Reconciliation & Safety Agent for Healthcare
 
-> **Built for the [Agents Assemble Hackathon](https://agents-assemble.devpost.com/) — Option 3: Custom A2A Agent**
+> Production-grade medication safety agent built on open healthcare standards (MCP, A2A, FHIR)
 
 MedHarmony is an AI-powered A2A (Agent-to-Agent) agent that performs **intelligent medication reconciliation** across care transitions. It identifies dangerous drug interactions, flags contraindications based on patient-specific lab values, suggests evidence-based deprescribing opportunities, and generates clinician-ready safety briefs — all grounded in real FHIR patient data.
 
@@ -25,22 +25,26 @@ MedHarmony is an AI-powered A2A (Agent-to-Agent) agent that performs **intellige
 
 ```
 Prompt Opinion Workspace              MedHarmony Infrastructure
-┌─────────────────────┐               ┌──────────────────────────────────┐
-│                     │   FHIR        │     MedHarmony A2A Agent         │
-│  User ──► User      │   Context     │                                  │
-│           Agent  ───┼──────────────►│  ┌─ Reconciliation Engine        │
-│                     │  (SHARP)      │  ├─ Interaction Analyzer          │
-│                     │               │  ├─ Deprescribing Advisor         │
-└─────────────────────┘               │  └─ Clinician Brief Generator     │
-                                      │                                  │
-                                      │  LLM: Claude (Anthropic API)     │
-                                      │                                  │
-                                      │  MCP Servers:                    │
-                                      │  ├─ FHIR Data Server             │
-                                      │  ├─ Drug Interaction Server      │
-                                      │  └─ Clinical Guidelines Server   │
-                                      └──────────────────────────────────┘
+┌─────────────────────┐               ┌──────────────────────────────────────┐
+│                     │   FHIR        │     MedHarmony A2A Agent             │
+│  User ──► User      │   Context     │                                      │
+│           Agent  ───┼──────────────►│  ┌─ Reconciliation Engine            │
+│                     │  (SHARP)      │  ├─ Interaction Analyzer             │
+│                     │               │  ├─ Deprescribing Advisor            │
+└─────────────────────┘               │  └─ Clinician Brief Generator        │
+                                      │                                      │
+                                      │  LLM: Google Gemini 3.0 Flash        │
+                                      │                                      │
+                                      │  MCP Servers (agentic tool use):     │
+                                      │  ├─ FHIR Data Server                 │
+                                      │  ├─ Drug Interaction Server          │
+                                      │  └─ Clinical Guidelines Server       │
+                                      └──────────────────────────────────────┘
 ```
+
+The agent uses Gemini's native function-calling to autonomously decide which MCP
+tools to invoke, in what order, during each reasoning step — producing a fully
+traceable agentic execution log.
 
 ---
 
@@ -49,10 +53,11 @@ Prompt Opinion Workspace              MedHarmony Infrastructure
 | Feature | Description | Prompt Opinion 5T |
 |---------|-------------|-------------------|
 | **Medication Reconciliation** | Compares med lists across admission, discharge, outpatient | 📊 Table |
-| **Interaction Analysis** | Drug-drug, drug-condition, drug-allergy checks | 💬 Talk |
+| **Interaction Analysis** | Drug-drug, drug-condition, drug-allergy checks via RxNorm | 💬 Talk |
 | **Deprescribing Advisor** | Beers Criteria / STOPP-START guided recommendations | 📄 Template |
 | **FHIR Write-back** | Updates reconciled medication list in EHR | 🔄 Transaction |
 | **Follow-up Tasks** | Creates tasks for clinician review items | ✅ Task |
+| **Agentic Tool Trace** | Full audit log of every MCP tool call and result | 🔍 Trace |
 
 ---
 
@@ -61,7 +66,7 @@ Prompt Opinion Workspace              MedHarmony Infrastructure
 ### Prerequisites
 
 - Python 3.11+
-- [Anthropic API Key](https://console.anthropic.com/)
+- [Google Gemini API Key](https://aistudio.google.com/apikey)
 - [Prompt Opinion Account](https://app.promptopinion.ai)
 
 ### Installation
@@ -80,22 +85,20 @@ pip install -r requirements.txt
 
 # Copy environment config
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env and add your GEMINI_API_KEY
 ```
 
 ### Run the Agent
 
 ```bash
-# Start MCP servers
-python -m src.mcp_servers.fhir_server.server &
-python -m src.mcp_servers.drug_interaction_server.server &
-python -m src.mcp_servers.clinical_guidelines_server.server &
-
-# Start the A2A agent
+# Start the A2A agent (MCP servers are launched automatically by the bridge)
 python -m src.agent.server
 
 # Or use the convenience script
 ./scripts/start.sh
+
+# Run the full demo (shows agentic tool-call trace)
+./scripts/demo.sh
 ```
 
 ### Run with Docker
@@ -106,28 +109,41 @@ docker-compose up --build
 
 ---
 
-## 📋 Judging Criteria Alignment
-
-| Criteria | How MedHarmony Delivers |
-|----------|------------------------|
-| **The AI Factor** | Uses Claude for multi-step clinical reasoning over unstructured data — impossible with rule-based systems |
-| **Potential Impact** | Targets medication errors ($177B/year cost), polypharmacy (40%+ elderly), and care transitions |
-| **Feasibility** | Built on standard FHIR resources, open drug databases (RxNorm/OpenFDA), and published clinical guidelines |
-
----
-
 ## 🛠️ Tech Stack
 
 - **Agent Protocol**: A2A (Agent-to-Agent) with SHARP context propagation
 - **Tool Protocol**: MCP (Model Context Protocol)
-- **LLM**: Claude (Anthropic API)
+- **LLM**: Google Gemini 3.0 Flash
 - **Healthcare Data**: HL7 FHIR R4
 - **Drug Data**: RxNorm / OpenFDA
-- **Clinical Guidelines**: Beers Criteria, STOPP/START v3
+- **Clinical Guidelines**: Beers Criteria 2023, STOPP/START v3
 - **Synthetic Data**: Synthea patient generator
 - **Language**: Python 3.11+
 - **Framework**: FastAPI + Uvicorn
 - **Platform**: Prompt Opinion Marketplace
+
+---
+
+## 🤖 Agentic Tool Use (Week 2)
+
+MedHarmony's core reasoning loop uses Gemini's native function-calling to
+autonomously orchestrate MCP tool calls. Watching the agent reason looks like:
+
+```
+[tool-loop] iteration=0  tool_calls=['get_patient_summary']
+  → calling tool: get_patient_summary({'patient_id': 'demo-001'})
+  ✓ get_patient_summary returned 2847 chars
+
+[tool-loop] iteration=1  tool_calls=['check_drug_interactions']
+  → calling tool: check_drug_interactions({'drug_list': ['warfarin', 'ibuprofen', 'apixaban']})
+  ✓ check_drug_interactions returned 1203 chars
+
+[tool-loop] iteration=2  tool_calls=['search_deprescribing_guidelines']
+  → calling tool: search_deprescribing_guidelines({'medications': ['diazepam', 'diphenhydramine'], 'age': 78, 'egfr': 32.0})
+  ✓ search_deprescribing_guidelines returned 984 chars
+
+Gemini finished after 3 tool iterations; response length: 4091 chars
+```
 
 ---
 
@@ -143,25 +159,21 @@ medharmony-agent/
 │   │   └── config.py       # Agent configuration
 │   ├── core/               # Business logic
 │   │   ├── reconciliation.py   # Med reconciliation engine
-│   │   ├── interactions.py     # Drug interaction analyzer
-│   │   ├── deprescribing.py    # Deprescribing advisor
-│   │   ├── brief_generator.py  # Clinician brief generator
-│   │   └── llm_client.py       # Claude API wrapper
+│   │   ├── llm_client.py       # Gemini API wrapper + agentic loop
+│   │   ├── mcp_tool_bridge.py  # MCP ↔ Gemini tool format bridge
+│   │   └── agent_loop.py       # Centralized agentic reasoning loop
 │   ├── mcp_servers/        # MCP tool servers
-│   │   ├── fhir_server/    # FHIR data access
-│   │   ├── drug_interaction_server/  # Drug interactions
-│   │   └── clinical_guidelines_server/ # Guidelines RAG
-│   ├── models/             # Data models
-│   │   ├── medication.py
-│   │   ├── patient.py
-│   │   └── fhir_types.py
+│   │   ├── fhir_server/    # FHIR data access (6 tools)
+│   │   ├── drug_interaction_server/  # RxNorm interactions (3 tools)
+│   │   └── clinical_guidelines_server/ # Beers/STOPP-START (3 tools)
+│   ├── models/             # Pydantic data models
 │   └── utils/              # Shared utilities
-│       ├── fhir_client.py
-│       ├── sharp_context.py
-│       └── logging.py
 ├── tests/                  # Test suite
 ├── data/                   # Synthetic data & guidelines
 ├── scripts/                # Helper scripts
+│   ├── start.sh
+│   ├── test.sh
+│   └── demo.sh             # Agentic tool-trace demo
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -178,7 +190,8 @@ MIT License — See [LICENSE](LICENSE)
 
 ## 🙏 Acknowledgments
 
-- [Prompt Opinion](https://www.promptopinion.ai/) for the platform and hackathon
-- [Anthropic](https://www.anthropic.com/) for Claude API
+- [Prompt Opinion](https://www.promptopinion.ai/) for the healthcare AI assembly platform
+- [Google DeepMind](https://deepmind.google/) for the Gemini API
 - [HL7 FHIR](https://hl7.org/fhir/) for healthcare data standards
 - [Synthea](https://synthetichealth.github.io/synthea/) for synthetic patient data
+- [Model Context Protocol](https://modelcontextprotocol.io/) for the tool integration standard
