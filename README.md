@@ -186,12 +186,3 @@ medharmony-agent/
 
 MIT License — See [LICENSE](LICENSE)
 
----
-
-## 🙏 Acknowledgments
-
-- [Prompt Opinion](https://www.promptopinion.ai/) for the healthcare AI assembly platform
-- [Google DeepMind](https://deepmind.google/) for the Gemini API
-- [HL7 FHIR](https://hl7.org/fhir/) for healthcare data standards
-- [Synthea](https://synthetichealth.github.io/synthea/) for synthetic patient data
-- [Model Context Protocol](https://modelcontextprotocol.io/) for the tool integration standard
