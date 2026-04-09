@@ -1,23 +1,36 @@
 """MedHarmony Core Reconciliation Engine.
 
 Orchestrates the full medication safety analysis pipeline:
-1. Pull patient context from FHIR
+1. Pull patient context from FHIR (or fall back to demo patient)
 2. Reconcile medication lists
-3. Analyze interactions
-4. Apply deprescribing guidelines
-5. Generate clinician brief
+3. Analyze interactions (with MCP tool bridge)
+4. Apply deprescribing guidelines (with MCP tool bridge)
+5. Render clinician brief via Jinja2 template
+
+Week 3 additions:
+- ReasoningTracer: full observability of every LLM call and tool call
+- AuditLog: HIPAA-style patient data access logging
+- SafetyGuards: final-pass validation before returning results
+- BriefRenderer: Jinja2-based deterministic brief formatting
+- Demo-mode: load from sample_patient_ids.json for predictable demos
+- Per-step try/except: one step failing never kills the whole pipeline
 """
 
 from __future__ import annotations
 
 import json
+import time
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 
+from src.agent.config import SYNTHETIC_PATIENTS_DIR
 from src.core.agent_loop import AgentLoop
+from src.core.brief_templates import BriefRenderer
 from src.core.llm_client import LLMClient
 from src.core.mcp_tool_bridge import MCPToolBridge
+from src.core.safety_guards import SafetyGuards
 from src.models.medication import (
     DeprescribingRecommendation,
     DrugInteraction,
@@ -27,7 +40,11 @@ from src.models.medication import (
     Severity,
     SharpContext,
 )
+from src.utils.audit_log import AuditLog
 from src.utils.fhir_client import FHIRClient
+from src.utils.observability import ReasoningTracer
+
+_SAMPLE_IDS_PATH = SYNTHETIC_PATIENTS_DIR / "sample_patient_ids.json"
 
 
 class ReconciliationEngine:
@@ -35,79 +52,191 @@ class ReconciliationEngine:
 
     def __init__(self):
         self.llm = LLMClient()
+        self._audit = AuditLog()
+        self._guards = SafetyGuards()
 
     async def run_full_analysis(
         self,
         sharp_context: SharpContext,
         user_message: Optional[str] = None,
+        demo_mode: bool = False,
     ) -> MedHarmonyResult:
-        """Run the complete MedHarmony analysis pipeline."""
-        logger.info(f"Starting full analysis for patient: {sharp_context.patient_id}")
+        """Run the complete MedHarmony analysis pipeline.
 
-        # =====================================================================
-        # Step 1: Pull patient context from FHIR
-        # =====================================================================
-        fhir_client = FHIRClient(
-            base_url=sharp_context.fhir_server_url or "https://hapi.fhir.org/baseR4",
-            auth_token=sharp_context.fhir_access_token,
+        Args:
+            sharp_context: SHARP context with patient_id and FHIR server URL.
+            user_message: Optional free-text from the user (not used in core pipeline).
+            demo_mode: If True, load patient from sample_patient_ids.json instead
+                       of a live FHIR server (useful for predictable demos).
+
+        Returns:
+            MedHarmonyResult with full analysis, reasoning trace, and safety-validated output.
+        """
+        patient_id = sharp_context.patient_id or "unknown"
+        logger.info(f"Starting full analysis for patient: {patient_id}")
+
+        # Initialise observability and audit
+        tracer = ReasoningTracer()
+        self._audit.log_access(
+            patient_id=patient_id,
+            user_role=sharp_context.user_role or "system",
+            action="full_medication_reconciliation",
+            accessed_resources=[
+                "Patient", "MedicationRequest", "MedicationStatement",
+                "AllergyIntolerance", "Condition", "Observation",
+            ],
+            organization_id=sharp_context.organization_id,
         )
 
-        try:
-            patient_ctx = await fhir_client.get_patient_context(
-                sharp_context.patient_id
+        # =====================================================================
+        # Step 1: Pull patient context from FHIR (or fallback)
+        # =====================================================================
+        step_start = tracer.start_timer()
+        patient_ctx: Optional[PatientContext] = None
+
+        if demo_mode:
+            patient_ctx = self._load_demo_patient(patient_id)
+            tracer.record(
+                "pipeline_step",
+                tool_name="fhir_data_pull",
+                result_summary=f"demo mode — loaded {patient_ctx.name}",
+                duration_ms=tracer.elapsed(step_start),
             )
-        except Exception as e:
-            logger.error(f"Failed to pull FHIR data: {e}")
-            # Fall back to synthetic data if FHIR pull fails
-            patient_ctx = self._get_demo_patient_context(sharp_context.patient_id)
+        else:
+            fhir_client = FHIRClient(
+                base_url=sharp_context.fhir_server_url or "https://hapi.fhir.org/baseR4",
+                auth_token=sharp_context.fhir_access_token,
+            )
+            try:
+                patient_ctx = await fhir_client.get_patient_context(patient_id)
+                tracer.record(
+                    "pipeline_step",
+                    tool_name="fhir_data_pull",
+                    result_summary=(
+                        f"loaded {patient_ctx.name or patient_id} — "
+                        f"{sum(len(ml.medications) for ml in patient_ctx.medication_lists)} meds"
+                    ),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                logger.info(f"FHIR data pulled: {patient_ctx.name}")
+            except Exception as exc:
+                tracer.record(
+                    "error",
+                    tool_name="fhir_data_pull",
+                    error=self._guards.redact_phi(str(exc)),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                self._audit.log_error(patient_id, "fhir_pull", str(exc))
+                logger.warning(f"FHIR pull failed — falling back to demo patient: {exc}")
+                patient_ctx = self._get_demo_patient_context(patient_id)
 
         # =====================================================================
-        # Initialize MCP Tool Bridge for agentic tool use
+        # Initialise MCP Tool Bridge
         # =====================================================================
         bridge: Optional[MCPToolBridge] = None
+        step_start = tracer.start_timer()
         try:
             bridge = MCPToolBridge()
             await bridge.initialize()
             tool_count = sum(len(v) for v in bridge.list_all_tools().values())
-            logger.info(f"MCPToolBridge ready: {tool_count} tools across 3 servers")
-        except Exception as e:
-            logger.warning(
-                f"MCPToolBridge unavailable — running without MCP tools: {e}"
+            tracer.record(
+                "pipeline_step",
+                tool_name="mcp_bridge_init",
+                result_summary=f"ready with {tool_count} tools",
+                duration_ms=tracer.elapsed(step_start),
             )
+            logger.info(f"MCPToolBridge ready: {tool_count} tools across 3 servers")
+        except Exception as exc:
+            tracer.record(
+                "error",
+                tool_name="mcp_bridge_init",
+                error=str(exc),
+                duration_ms=tracer.elapsed(step_start),
+            )
+            logger.warning(f"MCPToolBridge unavailable — running without MCP tools: {exc}")
+
+        # Initialise partial result lists (each step writes to these)
+        reconciliation: list[ReconciliationEntry] = []
+        interactions: list[DrugInteraction] = []
+        deprescribing: list[DeprescribingRecommendation] = []
 
         try:
-            # =====================================================================
+            # =================================================================
             # Step 2: Reconcile medication lists
-            # =====================================================================
+            # =================================================================
             logger.info("Step 2: Reconciling medication lists...")
-            reconciliation = await self._reconcile(patient_ctx)
+            step_start = tracer.start_timer()
+            try:
+                reconciliation = await self._reconcile(patient_ctx)
+                tracer.record(
+                    "pipeline_step",
+                    tool_name="medication_reconciliation",
+                    result_summary=f"{len(reconciliation)} reconciliation entries",
+                    duration_ms=tracer.elapsed(step_start),
+                )
+            except Exception as exc:
+                tracer.record(
+                    "error",
+                    tool_name="medication_reconciliation",
+                    error=str(exc),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                logger.error(f"Reconciliation step failed: {exc}")
+                # Continue with empty list — brief will note "Analysis incomplete"
 
-            # =====================================================================
-            # Step 3: Analyze drug interactions (with MCP drug interaction tools)
-            # =====================================================================
+            # =================================================================
+            # Step 3: Analyze drug interactions
+            # =================================================================
             logger.info("Step 3: Analyzing drug interactions...")
-            interactions = await self._analyze_interactions(patient_ctx, bridge)
+            step_start = tracer.start_timer()
+            try:
+                interactions = await self._analyze_interactions(patient_ctx, bridge, tracer)
+                tracer.record(
+                    "pipeline_step",
+                    tool_name="interaction_analysis",
+                    result_summary=f"{len(interactions)} interactions found",
+                    duration_ms=tracer.elapsed(step_start),
+                )
+            except Exception as exc:
+                tracer.record(
+                    "error",
+                    tool_name="interaction_analysis",
+                    error=str(exc),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                logger.error(f"Interaction analysis step failed: {exc}")
 
-            # =====================================================================
-            # Step 4: Apply deprescribing guidelines (with MCP guideline tools)
-            # =====================================================================
+            # =================================================================
+            # Step 4: Check deprescribing opportunities
+            # =================================================================
             logger.info("Step 4: Checking deprescribing opportunities...")
-            deprescribing = await self._check_deprescribing(patient_ctx, bridge)
-
-            # =====================================================================
-            # Step 5: Generate clinician brief
-            # =====================================================================
-            logger.info("Step 5: Generating clinician brief...")
-            brief = await self._generate_brief(
-                patient_ctx, reconciliation, interactions, deprescribing
-            )
+            step_start = tracer.start_timer()
+            try:
+                deprescribing = await self._check_deprescribing(patient_ctx, bridge, tracer)
+                tracer.record(
+                    "pipeline_step",
+                    tool_name="deprescribing_check",
+                    result_summary=f"{len(deprescribing)} recommendations",
+                    duration_ms=tracer.elapsed(step_start),
+                )
+            except Exception as exc:
+                tracer.record(
+                    "error",
+                    tool_name="deprescribing_check",
+                    error=str(exc),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                logger.error(f"Deprescribing step failed: {exc}")
 
         finally:
             if bridge:
-                await bridge.cleanup()
+                try:
+                    await bridge.cleanup()
+                except Exception as exc:
+                    logger.warning(f"MCPToolBridge cleanup error: {exc}")
 
         # =====================================================================
-        # Compile final result
+        # Compile counts and tasks
         # =====================================================================
         critical = sum(
             1 for i in interactions if i.severity == Severity.CRITICAL
@@ -124,14 +253,10 @@ class ReconciliationEngine:
         ) + sum(
             1 for d in deprescribing if d.severity == Severity.MODERATE
         )
-
-        total_meds = sum(
-            len(ml.medications) for ml in patient_ctx.medication_lists
-        )
-
-        # Build follow-up tasks
+        total_meds = sum(len(ml.medications) for ml in patient_ctx.medication_lists)
         tasks = self._build_tasks(interactions, deprescribing, reconciliation)
 
+        # Assemble result (without brief — renderer needs the complete result)
         result = MedHarmonyResult(
             patient_id=patient_ctx.patient_id,
             patient_name=patient_ctx.name,
@@ -142,15 +267,58 @@ class ReconciliationEngine:
             critical_issues=critical,
             high_issues=high,
             moderate_issues=moderate,
-            clinician_brief=brief,
+            clinician_brief="",
             tasks=tasks,
+            reasoning_trace=None,  # Will be set after brief generation
         )
+
+        # =====================================================================
+        # Step 5: Generate clinician brief via Jinja2 template
+        # =====================================================================
+        logger.info("Step 5: Generating clinician brief...")
+        step_start = tracer.start_timer()
+        try:
+            renderer = BriefRenderer()
+            result.clinician_brief = renderer.render(patient_ctx, result)
+            tracer.record(
+                "pipeline_step",
+                tool_name="clinician_brief",
+                result_summary=f"rendered {len(result.clinician_brief)} chars",
+                duration_ms=tracer.elapsed(step_start),
+            )
+        except Exception as exc:
+            tracer.record(
+                "error",
+                tool_name="clinician_brief",
+                error=str(exc),
+                duration_ms=tracer.elapsed(step_start),
+            )
+            logger.error(f"Brief generation failed: {exc}")
+            result.clinician_brief = (
+                f"## MedHarmony Safety Brief\n\n"
+                f"**Note:** Brief rendering incomplete: {exc}\n\n"
+                f"Analysis data is available in the structured JSON artifact."
+            )
+
+        # =====================================================================
+        # Safety guards — final validation pass
+        # =====================================================================
+        result, guard_warnings = self._guards.run_all(result)
+        result.safety_warnings = guard_warnings
+
+        # Attach the final trace
+        result.reasoning_trace = tracer.to_json()
 
         logger.info(
             f"Analysis complete: {critical} critical, {high} high, "
-            f"{moderate} moderate issues found across {total_meds} medications"
+            f"{moderate} moderate issues | {total_meds} medications | "
+            f"{len(tracer.entries)} trace steps"
         )
         return result
+
+    # =========================================================================
+    # Analysis sub-steps
+    # =========================================================================
 
     async def _reconcile(
         self, patient_ctx: PatientContext
@@ -181,8 +349,9 @@ class ReconciliationEngine:
         self,
         patient_ctx: PatientContext,
         bridge: Optional[MCPToolBridge] = None,
+        tracer: Optional[ReasoningTracer] = None,
     ) -> list[DrugInteraction]:
-        """Analyze drug interactions, using MCP drug interaction tools when available."""
+        """Analyze drug interactions using MCP tools when available."""
         all_meds = [
             med.model_dump()
             for ml in patient_ctx.medication_lists
@@ -220,7 +389,7 @@ Identify all of:
 
 Respond with a JSON array only (no markdown fences):
 [{"type":"drug-drug|drug-condition|drug-allergy|drug-lab|duplicate-therapy","severity":"critical|high|moderate|low","drug_a":"...","drug_b":"...","condition":"...","allergy":"...","lab":"...","description":"...","clinical_significance":"...","recommendation":"...","evidence_source":"..."}]"""
-            loop = AgentLoop(self.llm, bridge)
+            loop = AgentLoop(self.llm, bridge, tracer=tracer)
             raw = await loop.run(
                 prompt,
                 context=context,
@@ -235,6 +404,7 @@ Respond with a JSON array only (no markdown fences):
         self,
         patient_ctx: PatientContext,
         bridge: Optional[MCPToolBridge] = None,
+        tracer: Optional[ReasoningTracer] = None,
     ) -> list[DeprescribingRecommendation]:
         """Check for deprescribing opportunities using guideline MCP tools when available."""
         if patient_ctx.age and patient_ctx.age < 65:
@@ -269,7 +439,7 @@ deprescribing recommendations for each applicable medication.
 
 Respond with a JSON array only (no markdown fences):
 [{"medication":"...","criteria":"...","reason":"...","recommendation":"...","severity":"critical|high|moderate|low","tapering_plan":"...","alternatives":["..."]}]"""
-            loop = AgentLoop(self.llm, bridge)
+            loop = AgentLoop(self.llm, bridge, tracer=tracer)
             raw = await loop.run(
                 prompt,
                 context=context,
@@ -284,29 +454,6 @@ Respond with a JSON array only (no markdown fences):
 
         return self._parse_deprescribing(raw)
 
-    async def _generate_brief(
-        self,
-        patient_ctx: PatientContext,
-        reconciliation: list[ReconciliationEntry],
-        interactions: list[DrugInteraction],
-        deprescribing: list[DeprescribingRecommendation],
-    ) -> str:
-        """Generate the clinician safety brief."""
-        patient_dict = {
-            "patient_id": patient_ctx.patient_id,
-            "name": patient_ctx.name,
-            "age": patient_ctx.age,
-            "sex": patient_ctx.sex,
-        }
-
-        raw = await self.llm.generate_clinician_brief(
-            patient_dict,
-            [r.model_dump() for r in reconciliation],
-            [i.model_dump() for i in interactions],
-            [d.model_dump() for d in deprescribing],
-        )
-        return raw
-
     def _build_tasks(
         self,
         interactions: list[DrugInteraction],
@@ -316,7 +463,6 @@ Respond with a JSON array only (no markdown fences):
         """Build follow-up task list for clinician."""
         tasks = []
 
-        # Critical interactions need immediate action
         for ix in interactions:
             if ix.severity in (Severity.CRITICAL, Severity.HIGH):
                 tasks.append(
@@ -325,7 +471,6 @@ Respond with a JSON array only (no markdown fences):
                     f" — {ix.recommendation}"
                 )
 
-        # Deprescribing opportunities
         for dp in deprescribing:
             if dp.severity in (Severity.CRITICAL, Severity.HIGH):
                 tasks.append(
@@ -333,7 +478,6 @@ Respond with a JSON array only (no markdown fences):
                     f"(per {dp.criteria})"
                 )
 
-        # Reconciliation items needing review
         for rec in reconciliation:
             if rec.action.value == "review":
                 tasks.append(
@@ -343,100 +487,45 @@ Respond with a JSON array only (no markdown fences):
         return tasks
 
     # =========================================================================
-    # JSON Parsers (extract structured data from LLM responses)
+    # Demo / Synthetic Patient Loaders
     # =========================================================================
 
-    def _parse_json_from_llm(self, raw: str) -> list[dict]:
-        """Extract JSON array from LLM response (handles markdown fences)."""
-        text = raw.strip()
+    def _load_demo_patient(self, patient_id: str) -> PatientContext:
+        """Load a patient from sample_patient_ids.json for predictable demos.
 
-        # Remove markdown code fences
-        if "```json" in text:
-            text = text.split("```json")[1]
-        if "```" in text:
-            text = text.split("```")[0]
+        Falls back to the hardcoded demo patient if the file is missing or
+        if the patient_id is 'demo-001'.
+        """
+        if patient_id == "demo-001" or not _SAMPLE_IDS_PATH.exists():
+            return self._get_demo_patient_context(patient_id)
 
-        text = text.strip()
+        try:
+            records = json.loads(_SAMPLE_IDS_PATH.read_text(encoding="utf-8"))
+            record = next((r for r in records if r["patient_id"] == patient_id), None)
+            if record and record.get("fhir_server") != "local-demo":
+                # Real patient — fetch from FHIR synchronously is not ideal here,
+                # but demo mode is expected to fall through to the async path.
+                # For simplicity in demo mode, always fall back to demo-001.
+                logger.info(
+                    f"Demo mode: patient {patient_id} is a live HAPI patient; "
+                    "falling back to built-in demo patient for offline demo"
+                )
+        except Exception as exc:
+            logger.warning(f"Could not load sample_patient_ids.json: {exc}")
 
-        # Try to find JSON array
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(text[start:end])
-            except json.JSONDecodeError:
-                pass
-
-        logger.warning("Failed to parse JSON from LLM response")
-        return []
-
-    def _parse_reconciliation(self, raw: str) -> list[ReconciliationEntry]:
-        """Parse reconciliation entries from LLM response."""
-        items = self._parse_json_from_llm(raw)
-        entries = []
-        for item in items:
-            try:
-                entries.append(ReconciliationEntry(
-                    medication=item.get("medication", "Unknown"),
-                    action=item.get("action", "review"),
-                    reason=item.get("reason", ""),
-                    from_source=item.get("from_source"),
-                    current_dose=item.get("current_dose"),
-                    recommended_dose=item.get("recommended_dose"),
-                    notes=item.get("notes"),
-                ))
-            except Exception as e:
-                logger.warning(f"Failed to parse reconciliation entry: {e}")
-        return entries
-
-    def _parse_interactions(self, raw: str) -> list[DrugInteraction]:
-        """Parse interaction entries from LLM response."""
-        items = self._parse_json_from_llm(raw)
-        entries = []
-        for item in items:
-            try:
-                entries.append(DrugInteraction(
-                    type=item.get("type", "drug-drug"),
-                    severity=item.get("severity", "moderate"),
-                    drug_a=item.get("drug_a", "Unknown"),
-                    drug_b=item.get("drug_b"),
-                    condition=item.get("condition"),
-                    allergy=item.get("allergy"),
-                    lab=item.get("lab"),
-                    description=item.get("description", ""),
-                    clinical_significance=item.get("clinical_significance", ""),
-                    recommendation=item.get("recommendation", ""),
-                    evidence_source=item.get("evidence_source"),
-                ))
-            except Exception as e:
-                logger.warning(f"Failed to parse interaction: {e}")
-        return entries
-
-    def _parse_deprescribing(self, raw: str) -> list[DeprescribingRecommendation]:
-        """Parse deprescribing entries from LLM response."""
-        items = self._parse_json_from_llm(raw)
-        entries = []
-        for item in items:
-            try:
-                entries.append(DeprescribingRecommendation(
-                    medication=item.get("medication", "Unknown"),
-                    criteria=item.get("criteria", ""),
-                    reason=item.get("reason", ""),
-                    recommendation=item.get("recommendation", ""),
-                    severity=item.get("severity", "moderate"),
-                    tapering_plan=item.get("tapering_plan"),
-                    alternatives=item.get("alternatives", []),
-                ))
-            except Exception as e:
-                logger.warning(f"Failed to parse deprescribing rec: {e}")
-        return entries
-
-    # =========================================================================
-    # Demo / Synthetic Patient (for hackathon demo)
-    # =========================================================================
+        return self._get_demo_patient_context(patient_id)
 
     def _get_demo_patient_context(self, patient_id: str) -> PatientContext:
-        """Return a synthetic complex patient for offline demo and testing."""
+        """Return a rich synthetic patient for offline demo and testing.
+
+        Margaret Thompson is an intentionally complex patient with multiple
+        medication safety issues — designed to demonstrate every MedHarmony
+        analysis capability.
+
+        This is the FALLBACK used when:
+        - FHIR pull fails
+        - demo_mode=True and patient_id == 'demo-001'
+        """
         from src.models.medication import (
             Allergy, Condition, LabResult, Medication, MedicationList,
         )
@@ -462,48 +551,164 @@ Respond with a JSON array only (no markdown fences):
                 Condition(name="Generalized Anxiety Disorder", icd10_code="F41.1"),
             ],
             lab_results=[
-                LabResult(name="Creatinine", loinc_code="2160-0", value=1.8, unit="mg/dL", reference_range="0.6-1.2", is_abnormal=True),
-                LabResult(name="eGFR", loinc_code="33914-3", value=32.0, unit="mL/min/1.73m2", reference_range=">60", is_abnormal=True),
-                LabResult(name="Potassium", loinc_code="2823-3", value=5.3, unit="mEq/L", reference_range="3.5-5.0", is_abnormal=True),
-                LabResult(name="HbA1c", loinc_code="4548-4", value=7.8, unit="%", reference_range="<7.0", is_abnormal=True),
-                LabResult(name="INR", loinc_code="49765-1", value=2.8, unit="", reference_range="2.0-3.0", is_abnormal=False),
-                LabResult(name="ALT", loinc_code="1742-6", value=22.0, unit="U/L", reference_range="7-56", is_abnormal=False),
-                LabResult(name="Hemoglobin", loinc_code="718-7", value=10.8, unit="g/dL", reference_range="12-16", is_abnormal=True),
-                LabResult(name="Platelets", loinc_code="777-3", value=145.0, unit="10*3/uL", reference_range="150-400", is_abnormal=True),
+                LabResult(name="Creatinine", loinc_code="2160-0", value=1.8, unit="mg/dL",
+                          reference_range="0.6-1.2", is_abnormal=True),
+                LabResult(name="eGFR", loinc_code="33914-3", value=32.0,
+                          unit="mL/min/1.73m2", reference_range=">60", is_abnormal=True),
+                LabResult(name="Potassium", loinc_code="2823-3", value=5.3, unit="mEq/L",
+                          reference_range="3.5-5.0", is_abnormal=True),
+                LabResult(name="HbA1c", loinc_code="4548-4", value=7.8, unit="%",
+                          reference_range="<7.0", is_abnormal=True),
+                LabResult(name="INR", loinc_code="49765-1", value=2.8, unit="",
+                          reference_range="2.0-3.0", is_abnormal=False),
+                LabResult(name="ALT", loinc_code="1742-6", value=22.0, unit="U/L",
+                          reference_range="7-56", is_abnormal=False),
+                LabResult(name="Hemoglobin", loinc_code="718-7", value=10.8, unit="g/dL",
+                          reference_range="12-16", is_abnormal=True),
+                LabResult(name="Platelets", loinc_code="777-3", value=145.0,
+                          unit="10*3/uL", reference_range="150-400", is_abnormal=True),
             ],
             medication_lists=[
                 MedicationList(
                     source="admission_home_meds",
                     medications=[
-                        Medication(name="Metformin", dose="1000 mg", frequency="twice daily", route="oral", rxnorm_code="861004"),
-                        Medication(name="Warfarin", dose="5 mg", frequency="daily", route="oral", rxnorm_code="855332"),
-                        Medication(name="Lisinopril", dose="20 mg", frequency="daily", route="oral", rxnorm_code="314076"),
-                        Medication(name="Amlodipine", dose="10 mg", frequency="daily", route="oral", rxnorm_code="197361"),
-                        Medication(name="Metoprolol Tartrate", dose="50 mg", frequency="twice daily", route="oral", rxnorm_code="866514"),
-                        Medication(name="Omeprazole", dose="20 mg", frequency="daily", route="oral", rxnorm_code="198053"),
-                        Medication(name="Ibuprofen", dose="400 mg", frequency="three times daily", route="oral", rxnorm_code="197806"),
-                        Medication(name="Diazepam", dose="5 mg", frequency="at bedtime", route="oral", rxnorm_code="197591"),
-                        Medication(name="Diphenhydramine", dose="25 mg", frequency="at bedtime", route="oral", rxnorm_code="1049630"),
-                        Medication(name="Furosemide", dose="40 mg", frequency="daily", route="oral", rxnorm_code="197417"),
-                        Medication(name="Potassium Chloride", dose="20 mEq", frequency="daily", route="oral", rxnorm_code="198082"),
-                        Medication(name="Atorvastatin", dose="40 mg", frequency="at bedtime", route="oral", rxnorm_code="259255"),
+                        Medication(name="Metformin", dose="1000 mg", frequency="twice daily",
+                                   route="oral", rxnorm_code="861004"),
+                        Medication(name="Warfarin", dose="5 mg", frequency="daily",
+                                   route="oral", rxnorm_code="855332"),
+                        Medication(name="Lisinopril", dose="20 mg", frequency="daily",
+                                   route="oral", rxnorm_code="314076"),
+                        Medication(name="Amlodipine", dose="10 mg", frequency="daily",
+                                   route="oral", rxnorm_code="197361"),
+                        Medication(name="Metoprolol Tartrate", dose="50 mg",
+                                   frequency="twice daily", route="oral", rxnorm_code="866514"),
+                        Medication(name="Omeprazole", dose="20 mg", frequency="daily",
+                                   route="oral", rxnorm_code="198053"),
+                        Medication(name="Ibuprofen", dose="400 mg",
+                                   frequency="three times daily", route="oral",
+                                   rxnorm_code="197806"),
+                        Medication(name="Diazepam", dose="5 mg", frequency="at bedtime",
+                                   route="oral", rxnorm_code="197591"),
+                        Medication(name="Diphenhydramine", dose="25 mg",
+                                   frequency="at bedtime", route="oral", rxnorm_code="1049630"),
+                        Medication(name="Furosemide", dose="40 mg", frequency="daily",
+                                   route="oral", rxnorm_code="197417"),
+                        Medication(name="Potassium Chloride", dose="20 mEq",
+                                   frequency="daily", route="oral", rxnorm_code="198082"),
+                        Medication(name="Atorvastatin", dose="40 mg", frequency="at bedtime",
+                                   route="oral", rxnorm_code="259255"),
                     ],
                 ),
                 MedicationList(
                     source="discharge_medications",
                     medications=[
-                        Medication(name="Metformin", dose="500 mg", frequency="twice daily", route="oral", rxnorm_code="861004"),
-                        Medication(name="Warfarin", dose="5 mg", frequency="daily", route="oral", rxnorm_code="855332"),
-                        Medication(name="Lisinopril", dose="10 mg", frequency="daily", route="oral", rxnorm_code="314076"),
-                        Medication(name="Amlodipine", dose="10 mg", frequency="daily", route="oral", rxnorm_code="197361"),
-                        Medication(name="Metoprolol Succinate ER", dose="100 mg", frequency="daily", route="oral", rxnorm_code="866924"),
-                        Medication(name="Pantoprazole", dose="40 mg", frequency="daily", route="oral", rxnorm_code="261257"),
-                        Medication(name="Acetaminophen", dose="650 mg", frequency="as needed", route="oral", rxnorm_code="313782"),
-                        Medication(name="Furosemide", dose="40 mg", frequency="daily", route="oral", rxnorm_code="197417"),
-                        Medication(name="Potassium Chloride", dose="40 mEq", frequency="daily", route="oral", rxnorm_code="198082"),
-                        Medication(name="Atorvastatin", dose="40 mg", frequency="at bedtime", route="oral", rxnorm_code="259255"),
-                        Medication(name="Apixaban", dose="5 mg", frequency="twice daily", route="oral", rxnorm_code="1364430"),
+                        Medication(name="Metformin", dose="500 mg", frequency="twice daily",
+                                   route="oral", rxnorm_code="861004"),
+                        Medication(name="Warfarin", dose="5 mg", frequency="daily",
+                                   route="oral", rxnorm_code="855332"),
+                        Medication(name="Lisinopril", dose="10 mg", frequency="daily",
+                                   route="oral", rxnorm_code="314076"),
+                        Medication(name="Amlodipine", dose="10 mg", frequency="daily",
+                                   route="oral", rxnorm_code="197361"),
+                        Medication(name="Metoprolol Succinate ER", dose="100 mg",
+                                   frequency="daily", route="oral", rxnorm_code="866924"),
+                        Medication(name="Pantoprazole", dose="40 mg", frequency="daily",
+                                   route="oral", rxnorm_code="261257"),
+                        Medication(name="Acetaminophen", dose="650 mg",
+                                   frequency="as needed", route="oral", rxnorm_code="313782"),
+                        Medication(name="Furosemide", dose="40 mg", frequency="daily",
+                                   route="oral", rxnorm_code="197417"),
+                        Medication(name="Potassium Chloride", dose="40 mEq",
+                                   frequency="daily", route="oral", rxnorm_code="198082"),
+                        Medication(name="Atorvastatin", dose="40 mg", frequency="at bedtime",
+                                   route="oral", rxnorm_code="259255"),
+                        Medication(name="Apixaban", dose="5 mg", frequency="twice daily",
+                                   route="oral", rxnorm_code="1364430"),
                     ],
                 ),
             ],
         )
+
+    # =========================================================================
+    # JSON Parsers (extract structured data from LLM responses)
+    # =========================================================================
+
+    def _parse_json_from_llm(self, raw: str) -> list[dict]:
+        """Extract JSON array from LLM response (handles markdown fences)."""
+        text = raw.strip()
+
+        if "```json" in text:
+            text = text.split("```json")[1]
+        if "```" in text:
+            text = text.split("```")[0]
+
+        text = text.strip()
+
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("Failed to parse JSON from LLM response")
+        return []
+
+    def _parse_reconciliation(self, raw: str) -> list[ReconciliationEntry]:
+        items = self._parse_json_from_llm(raw)
+        entries = []
+        for item in items:
+            try:
+                entries.append(ReconciliationEntry(
+                    medication=item.get("medication", "Unknown"),
+                    action=item.get("action", "review"),
+                    reason=item.get("reason", ""),
+                    from_source=item.get("from_source"),
+                    current_dose=item.get("current_dose"),
+                    recommended_dose=item.get("recommended_dose"),
+                    notes=item.get("notes"),
+                ))
+            except Exception as exc:
+                logger.warning(f"Failed to parse reconciliation entry: {exc}")
+        return entries
+
+    def _parse_interactions(self, raw: str) -> list[DrugInteraction]:
+        items = self._parse_json_from_llm(raw)
+        entries = []
+        for item in items:
+            try:
+                entries.append(DrugInteraction(
+                    type=item.get("type", "drug-drug"),
+                    severity=item.get("severity", "moderate"),
+                    drug_a=item.get("drug_a", "Unknown"),
+                    drug_b=item.get("drug_b"),
+                    condition=item.get("condition"),
+                    allergy=item.get("allergy"),
+                    lab=item.get("lab"),
+                    description=item.get("description", ""),
+                    clinical_significance=item.get("clinical_significance", ""),
+                    recommendation=item.get("recommendation", ""),
+                    evidence_source=item.get("evidence_source"),
+                ))
+            except Exception as exc:
+                logger.warning(f"Failed to parse interaction: {exc}")
+        return entries
+
+    def _parse_deprescribing(self, raw: str) -> list[DeprescribingRecommendation]:
+        items = self._parse_json_from_llm(raw)
+        entries = []
+        for item in items:
+            try:
+                entries.append(DeprescribingRecommendation(
+                    medication=item.get("medication", "Unknown"),
+                    criteria=item.get("criteria", ""),
+                    reason=item.get("reason", ""),
+                    recommendation=item.get("recommendation", ""),
+                    severity=item.get("severity", "moderate"),
+                    tapering_plan=item.get("tapering_plan"),
+                    alternatives=item.get("alternatives", []),
+                ))
+            except Exception as exc:
+                logger.warning(f"Failed to parse deprescribing rec: {exc}")
+        return entries

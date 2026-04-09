@@ -382,8 +382,26 @@ For each recommendation, provide JSON:
         reconciliation: list[dict],
         interactions: list[dict],
         deprescribing: list[dict],
-    ) -> str:
-        """Generate a concise clinician safety brief."""
+    ) -> dict:
+        """Generate structured brief data for Jinja2 template rendering.
+
+        Returns a dict (not freeform markdown) so that brief_templates.py
+        can render consistent, professionally formatted output every time.
+
+        The dict contains:
+          - recommended_actions: list of specific action strings for the clinician
+          - clinical_assessment: brief narrative summary of the overall situation
+
+        The structural sections (reconciliation table, interaction findings, etc.)
+        are rendered directly from the structured analysis data in BriefRenderer,
+        so this method only generates the narrative/advisory content that benefits
+        from LLM generation.
+
+        Note: In the Week 3 pipeline, BriefRenderer.render() is called directly
+        from ReconciliationEngine._generate_brief() using the already-parsed
+        Python objects. This method is kept for backward compatibility and for
+        use cases where only the structured brief data dict is needed.
+        """
         context = f"""PATIENT: {json.dumps(patient_context, indent=2)}
 
 RECONCILIATION RESULTS: {json.dumps(reconciliation, indent=2)}
@@ -392,30 +410,45 @@ INTERACTION ANALYSIS: {json.dumps(interactions, indent=2)}
 
 DEPRESCRIBING RECOMMENDATIONS: {json.dumps(deprescribing, indent=2)}"""
 
-        prompt = """Generate a concise clinician safety brief in Markdown format.
+        prompt = """Based on the medication analysis above, generate structured brief data.
 
-Structure:
-# MedHarmony Safety Brief
-**Patient:** [Name] | **Age:** [X] | **Date:** [Today]
+Respond with a JSON object only (no markdown fences):
+{
+  "recommended_actions": [
+    "Numbered action item 1 — specific, actionable, clinician-directed",
+    "Numbered action item 2",
+    "..."
+  ],
+  "clinical_assessment": "2-3 sentence narrative summary of the most important safety issues and overall medication burden for this patient"
+}
 
-## ⚠️ Critical Alerts (if any)
-- List critical items requiring immediate attention
+Rules:
+- Each recommended_action must be specific and actionable (not generic)
+- Prioritise critical and high-severity issues first
+- Never make autonomous clinical decisions — frame as recommendations for clinician review
+- clinical_assessment should be scannable in under 30 seconds"""
 
-## 📋 Medication Reconciliation Summary
-- Key changes table: Medication | Action | Reason
+        raw = await self.analyze(prompt, context, response_format="json")
 
-## 💊 Interaction Alerts
-- Grouped by severity
+        # Parse the structured response
+        try:
+            text = raw.strip()
+            if "```json" in text:
+                text = text.split("```json")[1]
+            if "```" in text:
+                text = text.split("```")[0]
+            text = text.strip()
 
-## 📉 Deprescribing Opportunities
-- Evidence-based recommendations
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(text[start:end])
+                return {
+                    "recommended_actions": data.get("recommended_actions", []),
+                    "clinical_assessment": data.get("clinical_assessment", ""),
+                }
+        except Exception as exc:
+            logger.warning(f"generate_clinician_brief: failed to parse structured response: {exc}")
 
-## ✅ Recommended Actions
-- Numbered list of concrete next steps
-
-## 📊 Summary
-- Total meds: X | Critical: X | High: X | Moderate: X
-
-Keep it actionable and scannable. Clinicians have 30 seconds to review this."""
-
-        return await self.analyze(prompt, context, response_format="markdown")
+        # Fallback: return empty structure (BriefRenderer uses result.tasks instead)
+        return {"recommended_actions": [], "clinical_assessment": ""}

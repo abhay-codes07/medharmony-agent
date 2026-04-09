@@ -2,18 +2,26 @@
 
 Processes incoming A2A tasks, extracts SHARP context,
 routes to the reconciliation engine, and formats responses.
+
+Week 3 additions:
+- Reasoning trace included as a third A2A artifact
+- medharmony.reasoning_trace_url in metadata
+- Structured error artifact with trace on failure
+- AuditLog for all incoming tasks
 """
 
 from __future__ import annotations
 
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
 from src.core.reconciliation import ReconciliationEngine
 from src.models.medication import SharpContext
-from src.utils.sharp_context import extract_sharp_context, build_sharp_response_metadata
+from src.utils.audit_log import AuditLog
+from src.utils.sharp_context import build_sharp_response_metadata, extract_sharp_context
 
 
 class TaskHandler:
@@ -22,13 +30,15 @@ class TaskHandler:
     def __init__(self):
         self.engine = ReconciliationEngine()
         self.tasks: dict[str, dict] = {}  # In-memory task store
+        self._audit = AuditLog()
 
     async def handle_task(self, task_request: dict) -> dict:
         """Process an incoming A2A task request.
 
-        A2A tasks follow the flow:
-        1. Client sends tasks/send with a message
-        2. Agent processes and returns result as an artifact
+        Returns a completed A2A task with three artifacts:
+          1. clinician_safety_brief (Markdown)
+          2. analysis_data (structured JSON)
+          3. reasoning_trace (agent loop observability)
         """
         task_id = task_request.get("id", str(uuid.uuid4()))
         messages = task_request.get("messages", [])
@@ -36,19 +46,19 @@ class TaskHandler:
 
         logger.info(f"Received task: {task_id}")
 
-        # Extract SHARP context
+        # Extract SHARP context from multiple locations
         sharp_context = extract_sharp_context(metadata)
 
-        # Also check for context in message parts
+        # Also check message parts for SHARP data
         if not sharp_context.patient_id and messages:
             for msg in messages:
                 for part in msg.get("parts", []):
                     if part.get("type") == "data":
                         data = part.get("data", {})
-                        if not sharp_context.patient_id:
-                            sharp_ctx = extract_sharp_context(data)
-                            if sharp_ctx.patient_id:
-                                sharp_context = sharp_ctx
+                        sharp_ctx = extract_sharp_context(data)
+                        if sharp_ctx.patient_id:
+                            sharp_context = sharp_ctx
+                            break
 
         # Extract user message text
         user_message = ""
@@ -58,19 +68,24 @@ class TaskHandler:
                     if part.get("type") == "text":
                         user_message = part.get("text", "")
 
-        # Check for patient_id in user message if not in SHARP context
-        if not sharp_context.patient_id:
-            # Try to extract patient ID from message text
-            import re
-            match = re.search(r'patient[_\s-]?(?:id)?[:\s]+(\S+)', user_message, re.I)
+        # Try to extract patient_id from message text as last resort
+        if not sharp_context.patient_id and user_message:
+            match = re.search(r"patient[_\s\-]?(?:id)?[:\s]+(\S+)", user_message, re.I)
             if match:
                 sharp_context.patient_id = match.group(1)
 
-        # Determine which skill to invoke based on the message
         skill = self._determine_skill(user_message)
         logger.info(f"Invoking skill: {skill}")
 
-        # Update task status
+        # Audit the incoming task
+        self._audit.log_access(
+            patient_id=sharp_context.patient_id or "unknown",
+            user_role=sharp_context.user_role or "system",
+            action=f"a2a_task:{skill}",
+            accessed_resources=["A2A"],
+        )
+
+        # Update task status to working
         self.tasks[task_id] = {
             "id": task_id,
             "status": "working",
@@ -79,13 +94,15 @@ class TaskHandler:
         }
 
         try:
-            # Run the analysis
             result = await self.engine.run_full_analysis(
                 sharp_context=sharp_context,
                 user_message=user_message,
             )
 
-            # Build A2A response with artifacts
+            # Build the trace URL (placeholder — real URL would be set post-deploy)
+            agent_url = metadata.get("agent_url", "")
+            trace_url = f"{agent_url}/tasks/{task_id}/trace" if agent_url else None
+
             response_task = {
                 "id": task_id,
                 "status": "completed",
@@ -101,10 +118,10 @@ class TaskHandler:
                     }
                 ],
                 "artifacts": [
-                    # Artifact 1: Clinician Brief (markdown)
+                    # Artifact 1: Clinician Brief (Markdown — rendered via Jinja2)
                     {
                         "name": "clinician_safety_brief",
-                        "description": "MedHarmony Clinician Safety Brief",
+                        "description": "MedHarmony Clinician Safety Brief (Jinja2-rendered)",
                         "parts": [
                             {
                                 "type": "text",
@@ -116,11 +133,26 @@ class TaskHandler:
                     # Artifact 2: Structured analysis data (JSON)
                     {
                         "name": "analysis_data",
-                        "description": "Structured medication analysis data",
+                        "description": "Structured medication analysis data (JSON)",
                         "parts": [
                             {
                                 "type": "data",
-                                "data": result.model_dump(),
+                                "data": result.model_dump(exclude={"reasoning_trace"}),
+                                "metadata": {"mimeType": "application/json"},
+                            }
+                        ],
+                    },
+                    # Artifact 3: Reasoning trace (Week 3 — full observability)
+                    {
+                        "name": "reasoning_trace",
+                        "description": (
+                            "MedHarmony agent reasoning trace — "
+                            "every LLM call, tool call, and pipeline step"
+                        ),
+                        "parts": [
+                            {
+                                "type": "data",
+                                "data": result.reasoning_trace or {},
                                 "metadata": {"mimeType": "application/json"},
                             }
                         ],
@@ -134,6 +166,14 @@ class TaskHandler:
                         "high_issues": result.high_issues,
                         "moderate_issues": result.moderate_issues,
                         "tasks_generated": len(result.tasks),
+                        "reasoning_trace_steps": (
+                            result.reasoning_trace.get("step_count", 0)
+                            if result.reasoning_trace
+                            else 0
+                        ),
+                        "reasoning_trace_url": trace_url,
+                        "safety_warnings": result.safety_warnings,
+                        "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                 },
             }
@@ -142,8 +182,9 @@ class TaskHandler:
             logger.info(f"Task {task_id} completed successfully")
             return response_task
 
-        except Exception as e:
-            logger.error(f"Task {task_id} failed: {e}")
+        except Exception as exc:
+            logger.error(f"Task {task_id} failed: {exc}")
+
             error_task = {
                 "id": task_id,
                 "status": "failed",
@@ -153,14 +194,39 @@ class TaskHandler:
                         "parts": [
                             {
                                 "type": "text",
-                                "text": f"MedHarmony analysis failed: {str(e)}. "
-                                        f"Please ensure a valid patient ID is provided "
-                                        f"in the SHARP context.",
+                                "text": (
+                                    f"MedHarmony analysis failed: {str(exc)}. "
+                                    f"Please ensure a valid patient ID is provided "
+                                    f"in the SHARP context."
+                                ),
                             }
                         ],
                     }
                 ],
-                "metadata": metadata,
+                "artifacts": [
+                    {
+                        "name": "error_details",
+                        "description": "Error information for debugging",
+                        "parts": [
+                            {
+                                "type": "data",
+                                "data": {
+                                    "error": str(exc),
+                                    "task_id": task_id,
+                                    "patient_id": sharp_context.patient_id,
+                                },
+                                "metadata": {"mimeType": "application/json"},
+                            }
+                        ],
+                    }
+                ],
+                "metadata": {
+                    **metadata,
+                    "medharmony": {
+                        "error": str(exc),
+                        "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                },
             }
             self.tasks[task_id] = error_task
             return error_task
@@ -176,7 +242,6 @@ class TaskHandler:
         elif any(kw in message_lower for kw in ["brief", "summary", "report"]):
             return "clinician-safety-brief"
         else:
-            # Default: run full analysis (includes all skills)
             return "full-analysis"
 
     def _build_response_text(self, result) -> str:
@@ -198,8 +263,16 @@ class TaskHandler:
             lines.append("")
             lines.append(f"✅ **{len(result.tasks)}** follow-up tasks generated")
 
+        if result.reasoning_trace:
+            steps = result.reasoning_trace.get("step_count", 0)
+            dur = result.reasoning_trace.get("total_duration_ms", 0)
+            lines.append(f"🔍 Reasoning trace: {steps} steps in {dur:.0f} ms")
+
         lines.append("")
-        lines.append("See the attached **Clinician Safety Brief** for full details.")
+        lines.append(
+            "See the attached **Clinician Safety Brief** (Artifact 1) and "
+            "**Reasoning Trace** (Artifact 3) for full details."
+        )
 
         return "\n".join(lines)
 

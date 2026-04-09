@@ -180,11 +180,17 @@ class MedHarmonyResult(BaseModel):
     high_issues: int = 0
     moderate_issues: int = 0
 
-    # Clinician brief (markdown)
+    # Clinician brief (markdown, rendered via Jinja2 template in Week 3+)
     clinician_brief: str = ""
 
     # Follow-up tasks
     tasks: list[str] = []
+
+    # Reasoning trace (Week 3 — full agent loop observability)
+    reasoning_trace: Optional[dict] = None
+
+    # Safety guard warnings (Week 3)
+    safety_warnings: list[str] = []
 
 
 # =============================================================================

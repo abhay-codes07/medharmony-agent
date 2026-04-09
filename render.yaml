@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: medharmony-agent
+    runtime: python
+    region: oregon
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.agent.server
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # Set this in the Render dashboard — never commit secrets
+
+      - key: A2A_AGENT_URL
+        fromService:
+          type: web
+          name: medharmony-agent
+          property: host       # Render injects the deployed URL automatically
+
+      - key: A2A_HOST
+        value: 0.0.0.0
+
+      - key: A2A_PORT
+        value: "10000"         # Render uses port 10000 for web services
+
+      - key: FHIR_SERVER_URL
+        value: https://hapi.fhir.org/baseR4
+
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      - key: PYTHON_VERSION
+        value: "3.11.0"

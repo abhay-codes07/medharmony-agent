@@ -1,11 +1,13 @@
 """Centralized agentic reasoning loop for MedHarmony.
 
-Wraps LLMClient.analyze_with_tools with structured loguru tracing so that
-every tool call, argument set, and result is captured in the execution log.
+Wraps LLMClient.analyze_with_tools with structured loguru tracing and optional
+ReasoningTracer integration so that every tool call, argument set, and result
+is captured for observability.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from google.genai import types
@@ -13,14 +15,21 @@ from loguru import logger
 
 from src.core.llm_client import LLMClient
 from src.core.mcp_tool_bridge import MCPToolBridge
+from src.utils.observability import ReasoningTracer
 
 
 class AgentLoop:
     """Orchestrates Gemini reasoning + MCP tool calls with full execution tracing."""
 
-    def __init__(self, llm: LLMClient, bridge: MCPToolBridge) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        bridge: MCPToolBridge,
+        tracer: Optional[ReasoningTracer] = None,
+    ) -> None:
         self.llm = llm
         self.bridge = bridge
+        self.tracer = tracer
 
     async def run(
         self,
@@ -34,7 +43,8 @@ class AgentLoop:
         executes them via the MCPToolBridge, and loops until it produces a final
         text response (or the max-iteration cap in LLMClient is reached).
 
-        Every tool call and result is logged at INFO level for a full audit trail.
+        Every tool call and result is logged at INFO level and recorded in the
+        optional ReasoningTracer for downstream observability.
 
         Args:
             prompt: Clinical reasoning prompt for Gemini.
@@ -71,12 +81,56 @@ class AgentLoop:
             f"{available_names}"
         )
 
+        # Record the LLM call start in the tracer
+        if self.tracer:
+            self.tracer.record(
+                "llm_call",
+                tool_name="gemini",
+                arguments={"tools": available_names, "prompt_length": len(prompt)},
+                result_summary="starting agentic loop",
+            )
+
         async def _traced_executor(tool_name: str, arguments: dict) -> str:
             logger.info(f"  → calling tool: {tool_name}({arguments})")
-            result = await self.bridge.execute_tool(tool_name, arguments)
-            logger.info(f"  ✓ {tool_name} returned {len(result)} chars")
-            return result
 
+            # Record tool call
+            if self.tracer:
+                self.tracer.record(
+                    "tool_call",
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+
+            call_start = time.monotonic()
+            try:
+                result = await self.bridge.execute_tool(tool_name, arguments)
+                dur = ReasoningTracer.elapsed(call_start)
+                logger.info(f"  ✓ {tool_name} returned {len(result)} chars")
+
+                # Record tool result
+                if self.tracer:
+                    self.tracer.record(
+                        "tool_result",
+                        tool_name=tool_name,
+                        result_summary=result[:200] if result else "(empty)",
+                        duration_ms=dur,
+                    )
+                return result
+
+            except Exception as exc:
+                dur = ReasoningTracer.elapsed(call_start)
+                logger.warning(f"  ✗ {tool_name} failed: {exc}")
+
+                if self.tracer:
+                    self.tracer.record(
+                        "error",
+                        tool_name=tool_name,
+                        error=str(exc),
+                        duration_ms=dur,
+                    )
+                raise
+
+        llm_start = time.monotonic()
         response = await self.llm.analyze_with_tools(
             prompt=prompt,
             tools=gemini_tools,
@@ -84,7 +138,17 @@ class AgentLoop:
             context=context,
         )
 
+        llm_dur = ReasoningTracer.elapsed(llm_start)
         logger.info(
             f"[agent-loop] Complete — response length: {len(response)} chars"
         )
+
+        if self.tracer:
+            self.tracer.record(
+                "llm_call",
+                tool_name="gemini",
+                result_summary=f"agentic loop complete ({len(response)} chars)",
+                duration_ms=llm_dur,
+            )
+
         return response
