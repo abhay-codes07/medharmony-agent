@@ -142,7 +142,7 @@ class TaskHandler:
                             }
                         ],
                     },
-                    # Artifact 3: Reasoning trace (Week 3 — full observability)
+                    # Artifact 3: Reasoning trace (full observability)
                     {
                         "name": "reasoning_trace",
                         "description": (
@@ -157,6 +157,21 @@ class TaskHandler:
                             }
                         ],
                     },
+                    # Artifact 4: Patient-facing plain-language brief (novel)
+                    {
+                        "name": "patient_discharge_brief",
+                        "description": (
+                            "Plain-language medication summary for the patient "
+                            "(8th-grade reading level, for discharge counseling)"
+                        ),
+                        "parts": [
+                            {
+                                "type": "text",
+                                "text": result.patient_brief,
+                                "metadata": {"mimeType": "text/markdown"},
+                            }
+                        ],
+                    },
                 ],
                 "metadata": {
                     **build_sharp_response_metadata(sharp_context),
@@ -166,6 +181,8 @@ class TaskHandler:
                         "high_issues": result.high_issues,
                         "moderate_issues": result.moderate_issues,
                         "tasks_generated": len(result.tasks),
+                        "prescribing_cascades_found": len(result.prescribing_cascades),
+                        "has_patient_brief": bool(result.patient_brief),
                         "reasoning_trace_steps": (
                             result.reasoning_trace.get("step_count", 0)
                             if result.reasoning_trace
@@ -263,6 +280,11 @@ class TaskHandler:
             lines.append("")
             lines.append(f"✅ **{len(result.tasks)}** follow-up tasks generated")
 
+        if result.prescribing_cascades:
+            lines.append(
+                f"🔗 **{len(result.prescribing_cascades)}** prescribing cascade(s) detected"
+            )
+
         if result.reasoning_trace:
             steps = result.reasoning_trace.get("step_count", 0)
             dur = result.reasoning_trace.get("total_duration_ms", 0)
@@ -270,8 +292,11 @@ class TaskHandler:
 
         lines.append("")
         lines.append(
-            "See the attached **Clinician Safety Brief** (Artifact 1) and "
-            "**Reasoning Trace** (Artifact 3) for full details."
+            "See the attached artifacts:\n"
+            "1. **Clinician Safety Brief** — professional brief with cascade analysis\n"
+            "2. **Analysis Data** — full structured JSON\n"
+            "3. **Reasoning Trace** — full agent observability\n"
+            "4. **Patient Discharge Brief** — plain-language for patient counseling"
         )
 
         return "\n".join(lines)

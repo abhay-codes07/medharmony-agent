@@ -76,6 +76,28 @@ No significant drug interactions identified with the current medication list.
 
 ---
 
+## 🔗 Prescribing Cascade Analysis
+
+> *Cascades are chains where Drug A's side effect caused Drug B to be prescribed, which caused Drug C...
+> Pair-based checkers are blind to these. This section requires multi-hop clinical reasoning.*
+
+{% if result.prescribing_cascades %}
+{% for cascade in result.prescribing_cascades %}
+### {{ cascade.severity | severity_emoji }} {{ cascade.root_medication }} → {{ cascade.chain | join(' → ') }} ({{ cascade.cascade_depth }}-link cascade)
+
+- **Root side effect:** {{ cascade.root_side_effect }}
+- **What's happening:** {{ cascade.chain_description }}
+- **Clinical recommendation:** {{ cascade.recommendation }}
+- **Medications to review for removal:** {{ cascade.medications_to_review | join(', ') }}
+{% if cascade.evidence_source %}- **Evidence:** {{ cascade.evidence_source }}{% endif %}
+
+{% endfor %}
+{% else %}
+No prescribing cascades identified in the current medication list.
+{% endif %}
+
+---
+
 ## 📉 Deprescribing Opportunities
 
 {% if has_deprescribing %}
@@ -120,6 +142,7 @@ No medications identified for deprescribing review at this time.
 | 🟠 High-Priority Issues | {{ summary_stats.high_issues }} |
 | 🟡 Moderate Issues | {{ summary_stats.moderate_issues }} |
 | 📉 Deprescribing Candidates | {{ summary_stats.deprescribing_candidates }} |
+| 🔗 Prescribing Cascades Detected | {{ summary_stats.prescribing_cascades }} |
 
 ---
 

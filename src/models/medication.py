@@ -160,6 +160,27 @@ class ReconciliationEntry(BaseModel):
     notes: Optional[str] = None
 
 
+class PrescribingCascade(BaseModel):
+    """A chain of medications where each drug treats a side effect of the previous one.
+
+    Example: Amlodipine → ankle edema → Furosemide → hypokalemia → KCl supplement
+             But patient is also on Lisinopril (K+-retaining ACE inhibitor)
+             → K+ already elevated → KCl dose doubled on discharge = hyperkalemia risk
+
+    This multi-hop reasoning is invisible to pair-based interaction checkers.
+    LLMs are uniquely capable of detecting these chains.
+    """
+    chain: list[str]               # ["Drug A (root)", "Drug B", "Drug C"]
+    chain_description: str         # Plain English explanation of the full causal chain
+    root_medication: str           # The medication that started the cascade
+    root_side_effect: str          # The side effect that triggered the first prescription
+    cascade_depth: int             # Number of links (2 = A→B, 3 = A→B→C, etc.)
+    severity: Severity
+    recommendation: str            # What to consider unwinding from the root
+    medications_to_review: list[str]  # Drugs in the chain that may be removable
+    evidence_source: Optional[str] = None
+
+
 class MedHarmonyResult(BaseModel):
     """Complete MedHarmony analysis result."""
     patient_id: str
@@ -174,22 +195,28 @@ class MedHarmonyResult(BaseModel):
     interactions: list[DrugInteraction] = []
     deprescribing: list[DeprescribingRecommendation] = []
 
+    # Prescribing cascade analysis (novel — multi-hop LLM reasoning)
+    prescribing_cascades: list[PrescribingCascade] = []
+
     # Summary stats
     total_medications: int = 0
     critical_issues: int = 0
     high_issues: int = 0
     moderate_issues: int = 0
 
-    # Clinician brief (markdown, rendered via Jinja2 template in Week 3+)
+    # Clinician brief (markdown, rendered via Jinja2 template)
     clinician_brief: str = ""
+
+    # Patient-facing plain-language brief (novel — for discharge counseling)
+    patient_brief: str = ""
 
     # Follow-up tasks
     tasks: list[str] = []
 
-    # Reasoning trace (Week 3 — full agent loop observability)
+    # Reasoning trace (full agent loop observability)
     reasoning_trace: Optional[dict] = None
 
-    # Safety guard warnings (Week 3)
+    # Safety guard warnings
     safety_warnings: list[str] = []
 
 

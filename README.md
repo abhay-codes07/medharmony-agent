@@ -6,7 +6,7 @@
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/abhay-codes07/medharmony-agent)
 
-MedHarmony is an AI-powered A2A (Agent-to-Agent) agent that performs **intelligent medication reconciliation** across care transitions. It identifies dangerous drug interactions, flags contraindications based on patient-specific lab values, suggests evidence-based deprescribing opportunities, and generates clinician-ready safety briefs — all grounded in real FHIR patient data.
+MedHarmony is an AI-powered A2A (Agent-to-Agent) agent that performs **intelligent medication reconciliation** across care transitions. It identifies dangerous drug interactions, flags contraindications based on patient-specific lab values, detects **multi-hop prescribing cascades** invisible to pair-based checkers, suggests evidence-based deprescribing opportunities, and generates both a clinician safety brief and a **plain-language patient discharge brief** — all grounded in real FHIR patient data.
 
 ---
 
@@ -37,25 +37,23 @@ Key Allergies: Penicillin, Sulfonamides
 > ⚠️ Immediate clinician review required before discharge.
 
 - Warfarin + Apixaban (Duplicate Therapy): Two anticoagulants simultaneously active.
-  Action: Confirm anticoagulation strategy — for clinician review.
-  Evidence: ACC/AHA Afib Guidelines 2023
-
 - Ibuprofen + CKD Stage 3b: NSAIDs contraindicated at eGFR <45.
-  Action: Discontinue ibuprofen, substitute acetaminophen — for clinician review.
-  Evidence: KDIGO 2023; Beers Criteria 2023
 
-## 📋 Medication Reconciliation Summary
-| Medication     | Admission     | Discharge     | Action       | Reason                    |
-|----------------|---------------|---------------|--------------|---------------------------|
-| Metformin      | 1000 mg BID   | 500 mg BID    | ✏️ MODIFY    | CKD dose reduction        |
-| Ibuprofen      | 400 mg TID    | —             | 🛑 DISCONTINUE | NSAID in CKD + anticoag |
-| Apixaban       | —             | 5 mg BID      | 🔍 REVIEW    | Duplicate anticoagulation |
-...
+## 🔗 Prescribing Cascade Analysis  ← NOVEL: multi-hop chain detection
+> Cascades are chains where Drug A's side effect caused Drug B to be prescribed...
+> Pair-based checkers are BLIND to these.
 
-📊 14 medications | 3 critical | 2 high | 3 moderate | 3 deprescribing candidates
+🟠 Amlodipine → Furosemide → Potassium Chloride (3-link cascade)
+  Root cause: Amlodipine edema (not fluid overload) → furosemide added →
+  hypokalemia → KCl added. Eliminate root cause → remove 2 medications.
+
+🟠 Ibuprofen → Pantoprazole (2-link cascade)
+  PPI added for NSAID GI protection. Ibuprofen now discontinued → PPI has no indication.
+
+## 📊 14 medications | 3 critical | 2 high | 3 moderate | 2 cascades detected
 ```
 
-*[Screenshot placeholder — Week 4 will add visual screenshots of the rendered brief]*
+> **See [`docs/sample_brief.md`](docs/sample_brief.md) for the full rendered clinician brief + patient discharge brief.**
 
 ---
 
@@ -69,7 +67,9 @@ Prompt Opinion Workspace              MedHarmony Infrastructure
 │           Agent  ───┼──────────────►│  ┌─ Reconciliation Engine                    │
 │                     │  (SHARP)      │  ├─ Interaction Analyzer (MCP tools)         │
 │                     │               │  ├─ Deprescribing Advisor (Beers/STOPP)      │
-└─────────────────────┘               │  ├─ Jinja2 Brief Renderer                   │
+└─────────────────────┘               │  ├─ 🆕 Prescribing Cascade Detector          │
+                                      │  ├─ Jinja2 Clinician Brief Renderer          │
+                                      │  ├─ 🆕 Patient Discharge Brief Renderer      │
                                       │  ├─ ReasoningTracer (observability)          │
                                       │  ├─ SafetyGuards (clinical validation)       │
                                       │  └─ AuditLog (HIPAA-style)                  │
@@ -99,6 +99,8 @@ Prompt Opinion Workspace              MedHarmony Infrastructure
 | **Safety Guards** | Clinical validation before output: framing, citations, severity | 3 |
 | **HIPAA Audit Log** | JSON audit log for every patient data access | 3 |
 | **Deploy to Render** | One-click deployment with render.yaml | 3 |
+| **🆕 Prescribing Cascade Detector** | Multi-hop LLM reasoning to detect Drug A→B→C side-effect chains invisible to pair-based checkers | 3 |
+| **🆕 Patient Discharge Brief** | Plain-language medication summary at 8th-grade reading level for patient counseling | 3 |
 
 ---
 
@@ -162,9 +164,46 @@ docker-compose up --build
 
 ---
 
+## 🆕 Novel Features: What Nobody Else Does
+
+### 🔗 Prescribing Cascade Detection
+
+Standard drug checkers test pairs. MedHarmony reasons over **multi-hop causal chains**:
+
+```
+Amlodipine (10 mg) → peripheral edema (side effect)
+  → Furosemide prescribed for "fluid overload" (misattributed)
+    → Hypokalemia (Furosemide side effect)
+      → Potassium Chloride 20→40 mEq/day added
+```
+
+**The problem:** K+ is now 5.3 (elevated) and the PotCl dose was just doubled — but the root cause is amlodipine edema, not fluid overload. Eliminate the root cause → remove 2 drugs.
+
+A pair checker sees: Furosemide + KCl = "monitor electrolytes." MedHarmony sees a 3-link cascade with a single fix.
+
+### 📋 Patient-Facing Discharge Brief
+
+Every A2A response generates two briefs:
+
+| Artifact | Audience | Format | Reading Level |
+|----------|----------|--------|---------------|
+| `clinician_safety_brief` | Doctor / Pharmacist | Clinical markdown with evidence | Professional |
+| `patient_discharge_brief` | Patient / Caregiver | Plain language | 8th grade |
+
+The patient brief replaces clinical jargon: "anticoagulant" → "blood thinner", "diuretic" → "water pill", "contraindicated" → "not safe for you right now".
+
+---
+
 ## 🔍 Reasoning Trace (Week 3)
 
-Every A2A response now includes a full reasoning trace as Artifact 3:
+Every A2A response now includes **4 artifacts**:
+
+1. `clinician_safety_brief` — Professional Markdown brief (Jinja2-rendered)
+2. `analysis_data` — Full structured JSON (interactions, reconciliation, cascades)
+3. `reasoning_trace` — Full agent observability (every LLM call + tool call)
+4. `patient_discharge_brief` — Plain-language patient counseling brief
+
+The reasoning trace (Artifact 3):
 
 ```json
 {
@@ -235,7 +274,7 @@ medharmony-agent/
 │   ├── agent/              # A2A Agent implementation
 │   │   ├── server.py       # FastAPI A2A server
 │   │   ├── agent_card.py   # A2A Agent Card (with SHARP, iconUrl, documentationUrl)
-│   │   ├── handler.py      # Task handler (3 artifacts: brief + data + trace)
+│   │   ├── handler.py      # Task handler (4 artifacts: brief + data + trace + patient brief)
 │   │   └── config.py       # Agent configuration
 │   ├── core/               # Business logic
 │   │   ├── reconciliation.py    # Main pipeline (FHIR → LLM → brief)
@@ -253,7 +292,8 @@ medharmony-agent/
 │       └── audit_log.py         # HIPAA audit logging (Week 3)
 ├── data/
 │   ├── templates/
-│   │   └── clinician_brief.md.j2   # Jinja2 brief template (Week 3)
+│   │   ├── clinician_brief.md.j2   # Jinja2 clinician brief template (Week 3)
+│   │   └── patient_brief.md.j2     # Plain-language patient brief template (Week 3)
 │   └── synthetic_patients/
 │       ├── README.md               # Synthea setup instructions
 │       └── sample_patient_ids.json # Known-good demo patients

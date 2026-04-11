@@ -27,7 +27,7 @@ from loguru import logger
 
 from src.agent.config import SYNTHETIC_PATIENTS_DIR
 from src.core.agent_loop import AgentLoop
-from src.core.brief_templates import BriefRenderer
+from src.core.brief_templates import BriefRenderer, PatientBriefRenderer
 from src.core.llm_client import LLMClient
 from src.core.mcp_tool_bridge import MCPToolBridge
 from src.core.safety_guards import SafetyGuards
@@ -36,6 +36,7 @@ from src.models.medication import (
     DrugInteraction,
     MedHarmonyResult,
     PatientContext,
+    PrescribingCascade,
     ReconciliationEntry,
     Severity,
     SharpContext,
@@ -159,6 +160,7 @@ class ReconciliationEngine:
         reconciliation: list[ReconciliationEntry] = []
         interactions: list[DrugInteraction] = []
         deprescribing: list[DeprescribingRecommendation] = []
+        prescribing_cascades: list[PrescribingCascade] = []
 
         try:
             # =================================================================
@@ -228,6 +230,33 @@ class ReconciliationEngine:
                 )
                 logger.error(f"Deprescribing step failed: {exc}")
 
+            # =================================================================
+            # Step 4.5: Detect prescribing cascades (novel — multi-hop LLM)
+            # =================================================================
+            logger.info("Step 4.5: Detecting prescribing cascades...")
+            step_start = tracer.start_timer()
+            try:
+                prescribing_cascades = await self._detect_cascades(patient_ctx)
+                tracer.record(
+                    "pipeline_step",
+                    tool_name="cascade_detection",
+                    result_summary=f"{len(prescribing_cascades)} cascade(s) detected",
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                if prescribing_cascades:
+                    logger.info(
+                        f"Cascade detector found {len(prescribing_cascades)} cascade(s): "
+                        + ", ".join(c.root_medication for c in prescribing_cascades)
+                    )
+            except Exception as exc:
+                tracer.record(
+                    "error",
+                    tool_name="cascade_detection",
+                    error=str(exc),
+                    duration_ms=tracer.elapsed(step_start),
+                )
+                logger.error(f"Cascade detection failed: {exc}")
+
         finally:
             if bridge:
                 try:
@@ -254,20 +283,22 @@ class ReconciliationEngine:
             1 for d in deprescribing if d.severity == Severity.MODERATE
         )
         total_meds = sum(len(ml.medications) for ml in patient_ctx.medication_lists)
-        tasks = self._build_tasks(interactions, deprescribing, reconciliation)
+        tasks = self._build_tasks(interactions, deprescribing, reconciliation, prescribing_cascades)
 
-        # Assemble result (without brief — renderer needs the complete result)
+        # Assemble result (without briefs — renderers need the complete result)
         result = MedHarmonyResult(
             patient_id=patient_ctx.patient_id,
             patient_name=patient_ctx.name,
             reconciliation=reconciliation,
             interactions=interactions,
             deprescribing=deprescribing,
+            prescribing_cascades=prescribing_cascades,
             total_medications=total_meds,
             critical_issues=critical,
             high_issues=high,
             moderate_issues=moderate,
             clinician_brief="",
+            patient_brief="",
             tasks=tasks,
             reasoning_trace=None,  # Will be set after brief generation
         )
@@ -299,6 +330,42 @@ class ReconciliationEngine:
                 f"**Note:** Brief rendering incomplete: {exc}\n\n"
                 f"Analysis data is available in the structured JSON artifact."
             )
+
+        # =====================================================================
+        # Step 5.5: Generate patient-facing plain-language brief
+        # =====================================================================
+        logger.info("Step 5.5: Generating patient brief...")
+        step_start = tracer.start_timer()
+        try:
+            patient_brief_data = await self.llm.generate_patient_brief_data(
+                patient_context={
+                    "patient_id": patient_ctx.patient_id,
+                    "name": patient_ctx.name,
+                    "age": patient_ctx.age,
+                    "sex": patient_ctx.sex,
+                },
+                reconciliation=[r.model_dump() for r in reconciliation],
+                interactions=[i.model_dump() for i in interactions],
+                deprescribing=[d.model_dump() for d in deprescribing],
+                cascades=[c.model_dump() for c in prescribing_cascades],
+            )
+            patient_renderer = PatientBriefRenderer()
+            result.patient_brief = patient_renderer.render(patient_ctx, patient_brief_data)
+            tracer.record(
+                "pipeline_step",
+                tool_name="patient_brief",
+                result_summary=f"rendered {len(result.patient_brief)} chars",
+                duration_ms=tracer.elapsed(step_start),
+            )
+        except Exception as exc:
+            tracer.record(
+                "error",
+                tool_name="patient_brief",
+                error=str(exc),
+                duration_ms=tracer.elapsed(step_start),
+            )
+            logger.error(f"Patient brief generation failed: {exc}")
+            result.patient_brief = PatientBriefRenderer._fallback(patient_ctx)
 
         # =====================================================================
         # Safety guards — final validation pass
@@ -454,11 +521,43 @@ Respond with a JSON array only (no markdown fences):
 
         return self._parse_deprescribing(raw)
 
+    async def _detect_cascades(
+        self, patient_ctx: PatientContext
+    ) -> list[PrescribingCascade]:
+        """Detect prescribing cascades using multi-hop LLM reasoning."""
+        all_meds = [
+            med.model_dump()
+            for ml in patient_ctx.medication_lists
+            for med in ml.medications
+        ]
+        if len(all_meds) < 2:
+            return []
+
+        # De-duplicate by name for cascade analysis (source doesn't matter here)
+        seen = set()
+        unique_meds = []
+        for m in all_meds:
+            if m["name"].lower() not in seen:
+                seen.add(m["name"].lower())
+                unique_meds.append(m)
+
+        patient_dict = {
+            "patient_id": patient_ctx.patient_id,
+            "age": patient_ctx.age,
+            "sex": patient_ctx.sex,
+            "conditions": [c.model_dump() for c in patient_ctx.conditions],
+            "lab_results": [l.model_dump() for l in patient_ctx.lab_results],
+        }
+
+        raw = await self.llm.detect_prescribing_cascades(patient_dict, unique_meds)
+        return self._parse_cascades(raw)
+
     def _build_tasks(
         self,
         interactions: list[DrugInteraction],
         deprescribing: list[DeprescribingRecommendation],
         reconciliation: list[ReconciliationEntry],
+        cascades: Optional[list[PrescribingCascade]] = None,
     ) -> list[str]:
         """Build follow-up task list for clinician."""
         tasks = []
@@ -482,6 +581,15 @@ Respond with a JSON array only (no markdown fences):
             if rec.action.value == "review":
                 tasks.append(
                     f"[RECONCILE] Resolve discrepancy for {rec.medication}: {rec.reason}"
+                )
+
+        # Cascade tasks — highlight high/critical chains for unwind consideration
+        for cascade in (cascades or []):
+            if cascade.severity in (Severity.CRITICAL, Severity.HIGH):
+                chain_str = " → ".join(cascade.chain)
+                tasks.append(
+                    f"[CASCADE] Review prescribing cascade: {chain_str} — "
+                    f"{cascade.recommendation}"
                 )
 
         return tasks
@@ -654,6 +762,27 @@ Respond with a JSON array only (no markdown fences):
 
         logger.warning("Failed to parse JSON from LLM response")
         return []
+
+    def _parse_cascades(self, raw: str) -> list[PrescribingCascade]:
+        """Parse prescribing cascade entries from LLM response."""
+        items = self._parse_json_from_llm(raw)
+        entries = []
+        for item in items:
+            try:
+                entries.append(PrescribingCascade(
+                    chain=item.get("chain", []),
+                    chain_description=item.get("chain_description", ""),
+                    root_medication=item.get("root_medication", "Unknown"),
+                    root_side_effect=item.get("root_side_effect", ""),
+                    cascade_depth=item.get("cascade_depth", len(item.get("chain", [])) - 1),
+                    severity=item.get("severity", "moderate"),
+                    recommendation=item.get("recommendation", ""),
+                    medications_to_review=item.get("medications_to_review", []),
+                    evidence_source=item.get("evidence_source"),
+                ))
+            except Exception as exc:
+                logger.warning(f"Failed to parse cascade: {exc}")
+        return entries
 
     def _parse_reconciliation(self, raw: str) -> list[ReconciliationEntry]:
         items = self._parse_json_from_llm(raw)

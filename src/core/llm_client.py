@@ -376,6 +376,147 @@ For each recommendation, provide JSON:
 ```"""
         return await self.analyze(prompt, context)
 
+    async def detect_prescribing_cascades(
+        self,
+        patient_context: dict,
+        medications: list[dict],
+    ) -> str:
+        """Detect prescribing cascades — chains where each drug treats a side effect
+        of the previous one.
+
+        This is multi-hop causal reasoning that pair-based interaction checkers
+        can never find. Gemini is uniquely capable of it.
+
+        Returns:
+            Raw JSON string (list of cascade objects).
+        """
+        context = f"""PATIENT CONTEXT:
+{json.dumps(patient_context, indent=2)}
+
+ALL MEDICATIONS (combined from all lists):
+{json.dumps(medications, indent=2)}"""
+
+        prompt = """Analyze this medication list for PRESCRIBING CASCADES — chains where one
+medication's side effect caused another medication to be prescribed, which may have
+caused yet another to be prescribed, and so on.
+
+COMMON REAL-WORLD CASCADE PATTERNS (use these as starting points, look for others too):
+- CCB (amlodipine, diltiazem, nifedipine) → peripheral edema → loop diuretic (furosemide, torsemide)
+  → electrolyte loss → potassium/magnesium supplement
+- NSAID (ibuprofen, naproxen, diclofenac) → GI irritation / ulcer → PPI or H2 blocker
+- ACE inhibitor → dry cough → antihistamine or cough suppressant
+- Statin → myalgia → muscle relaxant or NSAID → (if NSAID) → GI protectant
+- Bisphosphonate → esophageal irritation → PPI
+- Corticosteroid → hyperglycemia → oral antidiabetic or insulin
+- Opioid → constipation → laxative (and potentially opioid for pain from constipation)
+- Antipsychotic → weight gain / metabolic syndrome → diabetes medication
+- Beta-blocker → depression, fatigue → antidepressant
+- Loop diuretic → hypokalemia → potassium supplement — BUT if patient is ALSO on
+  ACE inhibitor + CKD → K+ is already elevated → potassium supplement worsens hyperkalemia
+
+Pay special attention to DOUBLE-DIRECTION cascades where the correction itself
+interacts with another condition (like the last example above).
+
+For each cascade found, respond with JSON array (no markdown fences):
+[{
+  "chain": ["Root Drug", "Drug 2", "Drug 3"],
+  "chain_description": "Plain English explanation of the full causal chain and why it matters",
+  "root_medication": "Root Drug",
+  "root_side_effect": "The specific side effect that triggered Drug 2",
+  "cascade_depth": 2,
+  "severity": "critical|high|moderate|low",
+  "recommendation": "Which drugs in the chain could be stopped if the root cause is addressed or managed differently",
+  "medications_to_review": ["Drug 2", "Drug 3"],
+  "evidence_source": "Clinical reference"
+}]
+
+If no cascades found: []"""
+
+        return await self.analyze(prompt, context)
+
+    async def generate_patient_brief_data(
+        self,
+        patient_context: dict,
+        reconciliation: list[dict],
+        interactions: list[dict],
+        deprescribing: list[dict],
+        cascades: list[dict],
+    ) -> dict:
+        """Generate plain-language patient brief content for discharge counseling.
+
+        Writes at 8th-grade reading level. Replaces medical jargon with plain English.
+        Returns a structured dict consumed by the PatientBriefRenderer Jinja2 template.
+        """
+        # Only pass high/critical interactions for warning signs — don't overwhelm patient
+        critical_interactions = [
+            i for i in interactions if i.get("severity") in ("critical", "high")
+        ]
+
+        context = f"""PATIENT: {json.dumps(patient_context, indent=2)}
+
+MEDICATION CHANGES (reconciliation):
+{json.dumps(reconciliation, indent=2)}
+
+CRITICAL SAFETY ISSUES:
+{json.dumps(critical_interactions, indent=2)}
+
+MEDICATIONS RECOMMENDED FOR REDUCTION:
+{json.dumps([d for d in deprescribing if d.get("severity") in ("critical", "high")], indent=2)}"""
+
+        prompt = """Write a plain-language medication summary for the patient to take home at discharge.
+This replaces the confusing 10-page discharge paperwork most patients ignore.
+
+WRITING RULES:
+- 8th-grade reading level — no medical jargon
+- Replace medical terms: "anticoagulant"→"blood thinner", "diuretic"→"water pill",
+  "antihypertensive"→"blood pressure medicine", "eGFR/creatinine"→"kidney test",
+  "benzodiazepine"→"nerve-calming pill", "NSAID"→"pain reliever like ibuprofen"
+- Be warm and reassuring — but specific about danger signs
+- Keep each explanation to 1-2 short sentences
+
+Respond with JSON only (no markdown fences):
+{
+  "greeting": "One warm sentence for the patient about their discharge",
+  "medications_continuing": [
+    {"name": "Medication name", "plain_name": "What patients call it", "why": "1 sentence why they take it"}
+  ],
+  "medications_stopped": [
+    {"name": "Medication name", "why_stopped": "Plain English reason. What to take instead if anything."}
+  ],
+  "medications_changed": [
+    {"name": "Medication name", "what_changed": "dose/frequency change in plain words", "why": "why it changed"}
+  ],
+  "medications_new": [
+    {"name": "Medication name", "plain_name": "Common name", "why": "1 sentence", "how_to_take": "When and how"}
+  ],
+  "warning_signs": [
+    {"sign": "Specific observable sign or symptom", "action": "call your doctor / call 911 / go to ER immediately"}
+  ],
+  "important_dos_and_donts": [
+    "Do NOT take ibuprofen, Advil, or Motrin — your doctor has switched you to Tylenol",
+    "..."
+  ],
+  "follow_up_reminder": "When to follow up and why it matters in plain words"
+}"""
+
+        raw = await self.analyze(prompt, context, response_format="json")
+
+        try:
+            text = raw.strip()
+            if "```json" in text:
+                text = text.split("```json")[1]
+            if "```" in text:
+                text = text.split("```")[0]
+            text = text.strip()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(text[start:end])
+        except Exception as exc:
+            logger.warning(f"generate_patient_brief_data: parse failed: {exc}")
+
+        return {}
+
     async def generate_clinician_brief(
         self,
         patient_context: dict,

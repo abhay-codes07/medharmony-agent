@@ -1,0 +1,105 @@
+# Your Medication Information — Take This Home
+
+**For:** {{ patient.name or "Patient" }}{% if patient.age %} (Age {{ patient.age }}){% endif %}
+**Prepared:** {{ generated_at }}
+**Reviewed by:** {{ clinician_name }}
+
+---
+
+{{ brief_data.greeting or "Thank you for letting us care for you. Here is what you need to know about your medications when you go home." }}
+
+---
+{% if brief_data.medications_stopped %}
+
+## 🛑 Medications You Are STOPPING
+
+These medications were stopped or removed during your hospital stay. **Do NOT refill them.**
+
+{% for med in brief_data.medications_stopped %}
+**{{ med.name }}**
+{{ med.why_stopped }}
+
+{% endfor %}
+{% endif %}
+{% if brief_data.medications_changed %}
+
+## ✏️ Medications That Are CHANGING
+
+The dose or timing of these medications changed:
+
+{% for med in brief_data.medications_changed %}
+**{{ med.name }}** — {{ med.what_changed }}
+*Why:* {{ med.why }}
+
+{% endfor %}
+{% endif %}
+{% if brief_data.medications_new %}
+
+## ➕ NEW Medications Starting
+
+{% for med in brief_data.medications_new %}
+**{{ med.name }}**{% if med.plain_name and med.plain_name != med.name %} ({{ med.plain_name }}){% endif %}
+*What it does:* {{ med.why }}
+*How to take it:* {{ med.how_to_take }}
+
+{% endfor %}
+{% endif %}
+{% if brief_data.medications_continuing %}
+
+## ✅ Medications You Are CONTINUING
+
+Keep taking these exactly as before:
+
+{% for med in brief_data.medications_continuing %}
+- **{{ med.name }}**{% if med.plain_name and med.plain_name != med.name %} ({{ med.plain_name }}){% endif %}: {{ med.why }}
+{% endfor %}
+{% endif %}
+
+---
+
+## ⚠️ Call Your Doctor RIGHT AWAY If You Notice:
+
+{% if brief_data.warning_signs %}
+{% for ws in brief_data.warning_signs %}
+🚨 **{{ ws.sign }}**
+→ *{{ ws.action }}*
+
+{% endfor %}
+{% else %}
+🚨 Any unusual bleeding or bruising
+→ *Call your doctor immediately*
+
+🚨 Feeling very confused, dizzy, or weak
+→ *Call your doctor immediately*
+
+🚨 Any new chest pain or trouble breathing
+→ *Call 911*
+{% endif %}
+
+---
+
+## 📋 Important Rules for Your Medications
+
+{% if brief_data.important_dos_and_donts %}
+{% for item in brief_data.important_dos_and_donts %}
+• {{ item }}
+{% endfor %}
+{% else %}
+• Take your medications at the same time every day
+• Do not stop any medication without talking to your doctor first
+• Keep a list of all your medications with you at all times
+• Tell any new doctor or dentist about ALL your medications
+{% endif %}
+
+---
+
+## 📅 Your Next Appointment
+
+{{ brief_data.follow_up_reminder or "Please see your regular doctor within 7 days of leaving the hospital. Bring this paper and your medication bottles." }}
+
+---
+
+*📋 Keep this paper with you at the pharmacy and at your next doctor's visit.*
+*Questions about your medications? Call the phone number on your discharge paperwork.*
+*🤖 Prepared by MedHarmony — Reviewed by {{ clinician_name }}*
+*This is a summary only. It does not replace the advice of your doctor.*

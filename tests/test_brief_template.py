@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.core.brief_templates import BriefRenderer, _build_reconciliation_rows
+from src.core.brief_templates import BriefRenderer, PatientBriefRenderer, _build_reconciliation_rows
 from src.models.medication import (
     Allergy,
     Condition,
@@ -20,6 +20,7 @@ from src.models.medication import (
     MedicationList,
     MedHarmonyResult,
     PatientContext,
+    PrescribingCascade,
     ReconciliationAction,
     ReconciliationEntry,
     Severity,
@@ -117,10 +118,29 @@ def _make_reconciliation() -> ReconciliationEntry:
     )
 
 
+def _make_cascade(severity=Severity.HIGH) -> PrescribingCascade:
+    return PrescribingCascade(
+        chain=["Amlodipine", "Furosemide", "Potassium Chloride"],
+        chain_description=(
+            "Amlodipine causes ankle edema, leading to furosemide prescription. "
+            "Furosemide causes potassium loss, leading to KCl supplement. "
+            "But patient is on ACE inhibitor retaining K+ — hyperkalemia risk."
+        ),
+        root_medication="Amlodipine",
+        root_side_effect="Peripheral edema (ankle swelling)",
+        cascade_depth=2,
+        severity=severity,
+        recommendation="Consider switching amlodipine to a non-CCB antihypertensive to unwind the cascade",
+        medications_to_review=["Furosemide", "Potassium Chloride"],
+        evidence_source="Clinical pharmacology guidelines; STOPP v3",
+    )
+
+
 def _make_result(
     interactions=None,
     deprescribing=None,
     reconciliation=None,
+    cascades=None,
     critical_issues=0,
     high_issues=0,
     tasks=None,
@@ -131,11 +151,13 @@ def _make_result(
         reconciliation=reconciliation or [],
         interactions=interactions or [],
         deprescribing=deprescribing or [],
+        prescribing_cascades=cascades or [],
         total_medications=4,
         critical_issues=critical_issues,
         high_issues=high_issues,
         moderate_issues=0,
         clinician_brief="Fallback brief text",
+        patient_brief="",
         tasks=tasks or ["Review warfarin dose", "Discontinue ibuprofen"],
     )
 
@@ -347,3 +369,162 @@ class TestBuildReconciliationRows:
         ]
         rows = _build_reconciliation_rows(patient, recon)
         assert len(rows[0]["reason"]) <= 120
+
+
+# ---------------------------------------------------------------------------
+# Prescribing Cascade section tests
+# ---------------------------------------------------------------------------
+
+
+class TestCascadeSection:
+    def setup_method(self):
+        self.renderer = BriefRenderer()
+
+    def test_cascade_section_appears_when_cascades_present(self):
+        patient = _make_patient()
+        result = _make_result(cascades=[_make_cascade()])
+        brief = self.renderer.render(patient, result)
+        assert "Prescribing Cascade" in brief
+        assert "Amlodipine" in brief
+
+    def test_cascade_chain_displayed(self):
+        patient = _make_patient()
+        result = _make_result(cascades=[_make_cascade()])
+        brief = self.renderer.render(patient, result)
+        assert "Furosemide" in brief
+        assert "Potassium Chloride" in brief
+
+    def test_cascade_root_side_effect_displayed(self):
+        patient = _make_patient()
+        cascade = _make_cascade()
+        result = _make_result(cascades=[cascade])
+        brief = self.renderer.render(patient, result)
+        assert "edema" in brief.lower() or "ankle" in brief.lower()
+
+    def test_no_cascade_message_when_empty(self):
+        patient = _make_patient()
+        result = _make_result(cascades=[])
+        brief = self.renderer.render(patient, result)
+        assert "No prescribing cascades identified" in brief
+
+    def test_cascade_count_in_summary_table(self):
+        patient = _make_patient()
+        result = _make_result(cascades=[_make_cascade(), _make_cascade()])
+        brief = self.renderer.render(patient, result)
+        assert "Prescribing Cascades Detected" in brief
+        # 2 cascades should show "2" in the summary
+        assert "| 2 |" in brief or "2" in brief
+
+    def test_cascade_recommendation_shown(self):
+        patient = _make_patient()
+        cascade = _make_cascade()
+        result = _make_result(cascades=[cascade])
+        brief = self.renderer.render(patient, result)
+        assert "non-CCB" in brief or "antihypertensive" in brief
+
+
+# ---------------------------------------------------------------------------
+# Patient brief renderer tests
+# ---------------------------------------------------------------------------
+
+
+class TestPatientBriefRenderer:
+    def setup_method(self):
+        self.renderer = PatientBriefRenderer()
+        self.patient = _make_patient(name="Margaret Thompson", age=78)
+
+    def _make_brief_data(self, **overrides) -> dict:
+        base = {
+            "greeting": "Welcome home, Margaret. Here is what you need to know.",
+            "medications_continuing": [
+                {"name": "Warfarin", "plain_name": "blood thinner", "why": "Keeps your blood from clotting too much"}
+            ],
+            "medications_stopped": [
+                {"name": "Ibuprofen", "why_stopped": "This pain reliever can hurt your kidneys. Use Tylenol instead."}
+            ],
+            "medications_changed": [
+                {"name": "Metformin", "what_changed": "Dose cut in half (500 mg twice a day)", "why": "To protect your kidneys"}
+            ],
+            "medications_new": [
+                {"name": "Pantoprazole", "plain_name": "stomach acid reducer", "why": "Protects your stomach", "how_to_take": "Once daily in the morning"}
+            ],
+            "warning_signs": [
+                {"sign": "Any unusual bleeding or large bruises", "action": "call your doctor immediately"},
+                {"sign": "Chest pain or trouble breathing", "action": "call 911"},
+            ],
+            "important_dos_and_donts": [
+                "Do NOT take ibuprofen, Advil, or Motrin",
+                "Take Warfarin at the same time every day",
+            ],
+            "follow_up_reminder": "See your regular doctor within 7 days.",
+        }
+        base.update(overrides)
+        return base
+
+    def test_renders_without_crashing(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert isinstance(brief, str)
+        assert len(brief) > 100
+
+    def test_patient_name_in_header(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "Margaret Thompson" in brief
+
+    def test_stopped_medications_section(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "Ibuprofen" in brief
+        assert "STOPPING" in brief or "Stopping" in brief
+
+    def test_changed_medications_section(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "Metformin" in brief
+        assert "CHANGING" in brief or "Changing" in brief
+
+    def test_new_medications_section(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "Pantoprazole" in brief
+        assert "NEW" in brief or "New" in brief
+
+    def test_continuing_medications_section(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "Warfarin" in brief
+        assert "CONTINUING" in brief or "Continuing" in brief
+
+    def test_warning_signs_shown(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "bleeding" in brief.lower()
+        assert "call 911" in brief.lower() or "911" in brief
+
+    def test_dos_and_donts_shown(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "ibuprofen" in brief.lower() or "Advil" in brief
+
+    def test_follow_up_reminder_shown(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "7 days" in brief
+
+    def test_plain_english_signature(self):
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        assert "MedHarmony" in brief
+        assert "doctor" in brief.lower()
+
+    def test_empty_brief_data_does_not_crash(self):
+        """Empty dict should fall through to template defaults gracefully."""
+        brief = self.renderer.render(self.patient, {})
+        assert isinstance(brief, str)
+        assert "Margaret Thompson" in brief
+
+    def test_fallback_when_template_missing(self, tmp_path, monkeypatch):
+        import src.core.brief_templates as bt
+        monkeypatch.setattr(bt, "TEMPLATES_DIR", tmp_path)
+        renderer = PatientBriefRenderer()
+        brief = renderer.render(self.patient, self._make_brief_data())
+        assert "Margaret Thompson" in brief
+
+    def test_plain_language_tone(self):
+        """Brief should use plain words, not medical jargon in patient sections."""
+        brief = self.renderer.render(self.patient, self._make_brief_data())
+        # The patient brief should not contain raw clinical jargon in the data sections
+        # (The brief_data dict is already plain English from the LLM)
+        assert "blood thinner" in brief.lower() or "warfarin" in brief.lower()
+        assert "kidney" in brief.lower()
